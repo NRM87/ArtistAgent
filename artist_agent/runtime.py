@@ -220,8 +220,10 @@ def validate_backend_choices(args: argparse.Namespace) -> None:
             args.vision_backend = "ollama"
         if args.llm_backend not in ("ollama",):
             args.llm_backend = "ollama"
-        if args.image_backend not in ("ascii", "mock"):
+        if args.image_backend != "ascii":
             args.image_backend = "ascii"
+        if str(getattr(args, "image_fallback", "ascii")).strip().lower() not in ("ascii", "defer"):
+            args.image_fallback = "ascii"
 
     if not PROVIDER_CAPABILITIES.get(args.image_backend, {}).get("image", False):
         raise ValueError(f"{args.image_backend} is not supported for image generation backend.")
@@ -231,9 +233,16 @@ def validate_backend_choices(args: argparse.Namespace) -> None:
         raise ValueError(f"{args.vision_backend} is not supported for vision generation backend.")
     if args.llm_backend == "mock":
         raise ValueError("Mock critique backend is disabled. Use ollama/openai/anthropic/gemini for LLM-driven criticism.")
+    if args.image_backend == "mock":
+        raise ValueError("Mock image backend is disabled. Use ascii/openai/gemini.")
+    if str(getattr(args, "image_fallback", "defer")).strip().lower() == "mock":
+        raise ValueError("image_fallback=mock is disabled. Use image_fallback=ascii or defer.")
 
     if args.run_policy == "strict" and (args.vision_backend == "local" or args.llm_backend == "mock" or args.image_backend == "mock"):
-        raise ValueError("Strict mode requires hosted backends for vision, llm, and image. Use run_policy=hybrid or offline.")
+        raise ValueError(
+            "Strict mode disallows deterministic local vision and all mock backends. "
+            "Use hosted/ollama backends, or switch to hybrid/offline."
+        )
 
 
 def build_vision_backend(args: argparse.Namespace):
@@ -285,9 +294,10 @@ def build_llm_backend(args: argparse.Namespace):
     model = args.llm_model.strip() or DEFAULT_PROVIDER_MODELS[args.llm_backend]
     api_key = resolve_api_key(args.llm_backend, args.llm_api_key)
     if not api_key:
-        if not allow_fallback:
-            raise HostedCallError(f"No API key found for LLM backend {args.llm_backend} in strict mode.")
-        return MockLLMBackend()
+        raise HostedCallError(
+            f"No API key found for LLM backend {args.llm_backend}. "
+            "Configure an API key or switch llm_backend to ollama."
+        )
     return HostedLLMBackend(
         args.llm_backend,
         model,
@@ -309,9 +319,9 @@ def build_image_backend(args: argparse.Namespace, temp_dir: Path, llm_backend=No
         return MockImageBackend(temp_dir)
     fallback_mode = str(getattr(args, "image_fallback", "defer")).strip().lower() or "defer"
     ascii_size = str(getattr(args, "ascii_size", "160x60")).strip() or "160x60"
-    if fallback_mode not in ("defer", "mock", "ascii"):
+    if fallback_mode not in ("defer", "ascii"):
         fallback_mode = "defer"
-    allow_fallback = args.run_policy == "hybrid" or fallback_mode in ("mock", "ascii")
+    allow_fallback = args.run_policy == "hybrid" or fallback_mode == "ascii"
     model = args.image_model.strip() or DEFAULT_IMAGE_MODELS[args.image_backend]
     api_key = resolve_api_key(args.image_backend, args.image_api_key)
     if not api_key:
@@ -319,11 +329,9 @@ def build_image_backend(args: argparse.Namespace, temp_dir: Path, llm_backend=No
         # including strict policy where image generation should still proceed locally.
         if fallback_mode == "ascii":
             return AsciiImageBackend(temp_dir, llm_backend=llm_backend, ascii_size=ascii_size)
-        if fallback_mode == "mock":
-            return MockImageBackend(temp_dir)
         if not allow_fallback:
             raise HostedCallError(f"No API key found for image backend {args.image_backend} in strict mode.")
-        return MockImageBackend(temp_dir)
+        return AsciiImageBackend(temp_dir, llm_backend=llm_backend, ascii_size=ascii_size)
     return HostedImageBackend(
         args.image_backend,
         model,

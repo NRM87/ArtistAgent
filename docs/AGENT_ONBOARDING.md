@@ -58,8 +58,8 @@ Run sequence in `artist_agent/cycle.py`:
 - Backend classes and provider HTTP implementations.
 - Supports:
   - vision: local, hosted, ollama
-  - llm: mock, hosted, ollama
-  - image: mock, hosted
+  - llm: hosted, ollama
+  - image: hosted, ascii
   - fallback: LLM-generated ASCII with deterministic canvas enforcement
 
 `artist_agent/memory.py`
@@ -101,11 +101,13 @@ Important distinction:
 - Stale lock reclamation must remain safe.
 
 4. Policy semantics
-- `offline` must force local/mock path.
+- `offline` must force local Ollama text reasoning and ASCII image mode.
 - `strict` must reject local/mock core backends as configured.
+- Runtime should fail closed on LLM failures (no hidden deterministic critique fallback).
 
 5. Fallback consistency
 - ASCII fallback should remain model-aware and canvas-enforced.
+- Do not reintroduce template/deterministic ASCII rendering.
 
 ## Extension Playbook
 
@@ -135,6 +137,7 @@ Adding a new command:
 2. `backends.py` parsing
 - Provider response formats drift; parsing must be defensive.
 - Prefer strict JSON instructions and fallback behavior.
+- Keep fail-closed behavior for critique/judgment/revision paths.
 
 3. Profile drift
 - Defaults evolve over time.
@@ -173,4 +176,3 @@ If runtime seems broken:
 3. Ensure lock file is not stale:
    - `artists/<id>/.awaken.lock`
 4. Run with local fallback profile to isolate provider issues.
-

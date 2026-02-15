@@ -388,18 +388,6 @@ class AsciiImageBackend(ImageBackend):
         self.ascii_size = ascii_size
 
     @staticmethod
-    def _template_ascii(prompt: str, iteration: int, creation_id: int) -> str:
-        digest = hashlib.md5(prompt.encode("utf-8")).hexdigest()
-        motifs = [
-            ["   ┌───────┐", "  / ╱╲   ╱╲  \\", " │   ───     │", "  \\ ╲╱   ╲╱  /", "   └───────┘"],
-            ["      ▲      ", "     ▲█▲     ", "    ▲███▲    ", "   ▲█████▲   ", "  ─────────  "],
-            ["   ╭────────╮", "  ╱  ╲    ╱  ╲", " │    ╲  ╱    │", "  ╲   ╱╲╲    ╱", "   ╰────────╯"],
-            ["    ◜────◝   ", "   │ ░░░ │   ", "   │ ███ │   ", "   │ ░░░ │   ", "    ◟────◞   "],
-        ]
-        motif = motifs[int(digest[0:2], 16) % len(motifs)]
-        return "\n".join(motif)
-
-    @staticmethod
     def _sanitize_ascii(raw: str) -> str:
         text = str(raw).replace("\r\n", "\n").replace("\r", "\n").replace("\t", "    ")
         lines = []
@@ -467,55 +455,41 @@ class AsciiImageBackend(ImageBackend):
 
     def generate(self, prompt: str, iteration: int, creation_id: int) -> str:
         width, height = self._parse_ascii_size(self.ascii_size)
-        lines = []
-        if self.llm_backend is not None and hasattr(self.llm_backend, "generate_ascii_art"):
-            last_exc: Optional[Exception] = None
-            for attempt in range(3):
-                try:
-                    # Retry with stronger anti-collapse hints for small local models.
-                    variant_prompt = prompt
-                    if attempt == 1:
-                        variant_prompt += ". Avoid tiny icon output; use broad strokes over most of the canvas. Do not include readable text or notes."
-                    elif attempt == 2:
-                        variant_prompt += ". Avoid repeating recent motifs; commit to a distinct composition. Absolutely no readable words, captions, labels, or notes."
-                    llm_ascii = self.llm_backend.generate_ascii_art(variant_prompt, iteration, creation_id, width, height)
-                    canvas = self._enforce_canvas(self._sanitize_ascii(llm_ascii), width, height)
-                    if self._contains_readable_text(canvas):
-                        raise ValueError("ASCII output contained readable text.")
-                    if self._ink_ratio(canvas) < 0.006:
-                        raise ValueError("ASCII output too sparse.")
-                    lines = [
-                        f"ASCII ART - creation {creation_id} iter {iteration}",
-                        f"prompt: {prompt}",
-                        "renderer: llm",
-                        f"canvas: {width}x{height}",
-                        "",
-                        "BEGIN_ASCII",
-                        canvas,
-                        "END_ASCII",
-                        "",
-                    ]
-                    break
-                except Exception as exc:
-                    last_exc = exc
-            if not lines:
-                raise HostedCallError(f"LLM ASCII rendering failed after retries ({last_exc})")
+        if self.llm_backend is None or not hasattr(self.llm_backend, "generate_ascii_art"):
+            raise HostedCallError("ASCII image backend requires an LLM backend with generate_ascii_art().")
 
+        lines = []
+        last_exc: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                # Retry with stronger anti-collapse hints for small local models.
+                variant_prompt = prompt
+                if attempt == 1:
+                    variant_prompt += ". Avoid tiny icon output; use broad strokes over most of the canvas. Do not include readable text or notes."
+                elif attempt == 2:
+                    variant_prompt += ". Avoid repeating recent motifs; commit to a distinct composition. Absolutely no readable words, captions, labels, or notes."
+                llm_ascii = self.llm_backend.generate_ascii_art(variant_prompt, iteration, creation_id, width, height)
+                canvas = self._enforce_canvas(self._sanitize_ascii(llm_ascii), width, height)
+                if self._contains_readable_text(canvas):
+                    raise ValueError("ASCII output contained readable text.")
+                if self._ink_ratio(canvas) < 0.006:
+                    raise ValueError("ASCII output too sparse.")
+                lines = [
+                    f"ASCII ART - creation {creation_id} iter {iteration}",
+                    f"prompt: {prompt}",
+                    "renderer: llm",
+                    f"canvas: {width}x{height}",
+                    "",
+                    "BEGIN_ASCII",
+                    canvas,
+                    "END_ASCII",
+                    "",
+                ]
+                break
+            except Exception as exc:
+                last_exc = exc
         if not lines:
-            # Safety net for provider/parsing failures; keeps cycle functional.
-            template = self._template_ascii(prompt, iteration, creation_id)
-            canvas = self._enforce_canvas(template, width, height)
-            lines = [
-                f"ASCII ART - creation {creation_id} iter {iteration}",
-                f"prompt: {prompt}",
-                "renderer: template",
-                f"canvas: {width}x{height}",
-                "",
-                "BEGIN_ASCII",
-                canvas,
-                "END_ASCII",
-                "",
-            ]
+            raise HostedCallError(f"LLM ASCII rendering failed after retries ({last_exc})")
 
         path = self.temp_dir / f"img_{creation_id:04d}_iter_{iteration}.txt"
         path.write_text("\n".join(lines), encoding="utf-8")
@@ -710,7 +684,6 @@ class OllamaLLMBackend(LLMBackend):
         self.base_url = base_url
         self.temperature = temperature
         self.trace_prompts = trace_prompts
-        self.mock_fallback = MockLLMBackend()
 
     def _chat_text(
         self,
@@ -746,8 +719,8 @@ class OllamaLLMBackend(LLMBackend):
                 image_path=image_path,
             )
             return {"score": max(1, min(10, int(out.get("score", 0)))), "feedback": str(out.get("feedback", "Needs refinement."))}
-        except Exception:
-            return self.mock_fallback.critique(image_path, vision, iteration)
+        except Exception as exc:
+            raise HostedCallError(f"Ollama critique failed: {exc}") from exc
 
     def judge_worthiness(self, image_path: str, score: int, vision: str, critique_frame: str = "") -> bool:
         try:
@@ -757,8 +730,8 @@ class OllamaLLMBackend(LLMBackend):
                 image_path=image_path,
             )
             return bool(out.get("worthy", score >= 7))
-        except Exception:
-            return self.mock_fallback.judge_worthiness(image_path, score, vision)
+        except Exception as exc:
+            raise HostedCallError(f"Ollama judgment failed: {exc}") from exc
 
     def generate_text_memory(self, soul_data: Dict, creation_result: Dict, trigger_reason: str) -> Dict:
         try:
@@ -767,8 +740,8 @@ class OllamaLLMBackend(LLMBackend):
                 f"trigger:{trigger_reason}\nresult:{creation_result}",
             )
             return safe_text_memory(out, soul_data)
-        except Exception:
-            return self.mock_fallback.generate_text_memory(soul_data, creation_result, trigger_reason)
+        except Exception as exc:
+            raise HostedCallError(f"Ollama text-memory generation failed: {exc}") from exc
 
     def generate_ascii_art(self, prompt: str, iteration: int, creation_id: int, width: int = 0, height: int = 0) -> str:
         try:
@@ -785,86 +758,98 @@ class OllamaLLMBackend(LLMBackend):
                 timeout=180,
                 temperature_override=max(0.55, min(1.0, self.temperature + 0.25)),
             )
-        except Exception:
-            return self.mock_fallback.generate_ascii_art(prompt, iteration, creation_id, width, height)
+        except Exception as exc:
+            raise HostedCallError(f"Ollama ASCII generation failed: {exc}") from exc
 
     def generate_identity(self, current_name: str) -> Dict:
-        out = self._chat_json(
-            "Return strict JSON only: {\"name\": string, \"personality_traits\": [3-7 strings], \"current_obsession\": string}.",
-            f"Create a distinctive artistic identity. Current name hint: {current_name}",
-        )
-        name = str(out.get("name", "")).strip() or (current_name.strip() if current_name.strip() else "Unnamed Artist")
-        traits = out.get("personality_traits", [])
-        if not isinstance(traits, list):
-            traits = []
-        clean_traits = [str(t).strip() for t in traits if str(t).strip()][:7]
-        if len(clean_traits) < 3:
-            raise HostedCallError("LLM returned insufficient personality traits.")
-        obsession = str(out.get("current_obsession", "")).strip()
-        if not obsession:
-            raise HostedCallError("LLM returned empty obsession.")
-        return {"name": name, "personality_traits": clean_traits, "current_obsession": obsession}
+        try:
+            out = self._chat_json(
+                "Return strict JSON only: {\"name\": string, \"personality_traits\": [3-7 strings], \"current_obsession\": string}.",
+                f"Create a distinctive artistic identity. Current name hint: {current_name}",
+            )
+            name = str(out.get("name", "")).strip() or (current_name.strip() if current_name.strip() else "Unnamed Artist")
+            traits = out.get("personality_traits", [])
+            if not isinstance(traits, list):
+                traits = []
+            clean_traits = [str(t).strip() for t in traits if str(t).strip()][:7]
+            if len(clean_traits) < 3:
+                raise HostedCallError("LLM returned insufficient personality traits.")
+            obsession = str(out.get("current_obsession", "")).strip()
+            if not obsession:
+                raise HostedCallError("LLM returned empty obsession.")
+            return {"name": name, "personality_traits": clean_traits, "current_obsession": obsession}
+        except Exception as exc:
+            raise HostedCallError(f"Ollama identity generation failed: {exc}") from exc
 
     def generate_vision_fallback(self, soul: Dict) -> str:
-        text_memories = soul.get("text_memories", []) or []
-        prefs, principles, instructions, _ = infer_guidance(text_memories)
-        memories = soul.get("memories", []) or []
-        recent = [m.get("vision", "") for m in memories[-8:]]
-        packet = build_soul_packet(soul)
-        text = self._chat_text(
-            "Return exactly one concise art vision sentence. No JSON. No bullet points.",
-            (
-                VISION_WEIGHT_GUIDANCE
-                + TIER_GUIDANCE_TEXT
-                + f"soul_packet:{packet}\npreferences:{prefs[-8:]}\nprinciples:{principles[-8:]}\ninstructions:{instructions[-8:]}\nrecent:{recent}\n"
-                + "Prioritize novelty versus recent visions."
-            ),
-        )
-        vision = text.strip().strip('"').splitlines()[0].strip()
-        if not vision:
-            raise HostedCallError("LLM vision fallback returned empty vision.")
-        return vision
+        try:
+            text_memories = soul.get("text_memories", []) or []
+            prefs, principles, instructions, _ = infer_guidance(text_memories)
+            memories = soul.get("memories", []) or []
+            recent = [m.get("vision", "") for m in memories[-8:]]
+            packet = build_soul_packet(soul)
+            text = self._chat_text(
+                "Return exactly one concise art vision sentence. No JSON. No bullet points.",
+                (
+                    VISION_WEIGHT_GUIDANCE
+                    + TIER_GUIDANCE_TEXT
+                    + f"soul_packet:{packet}\npreferences:{prefs[-8:]}\nprinciples:{principles[-8:]}\ninstructions:{instructions[-8:]}\nrecent:{recent}\n"
+                    + "Prioritize novelty versus recent visions."
+                ),
+            )
+            vision = text.strip().strip('"').splitlines()[0].strip()
+            if not vision:
+                raise HostedCallError("LLM vision fallback returned empty vision.")
+            return vision
+        except Exception as exc:
+            raise HostedCallError(f"Ollama vision fallback failed: {exc}") from exc
 
     def generate_run_intent(self, soul_data: Dict) -> Dict:
-        packet = build_soul_packet(soul_data)
-        out = self._chat_json(
-            "Return strict JSON only: "
-            "{\"vision_directive\": string, \"critique_directive\": string, \"revision_directive\": string}.",
-            (
-                INTENT_WEIGHT_GUIDANCE
-                + TIER_GUIDANCE_TEXT
-                + "vision_directive should push distinct composition/motif from recent works.\n"
-                + "critique_directive should evaluate alignment with soul, not generic quality alone.\n"
-                + "revision_directive should explain how identity should evolve from outcome.\n"
-                + f"soul_packet:{packet}"
-            ),
-        )
-        return {
-            "vision_directive": str(out.get("vision_directive", "")).strip(),
-            "critique_directive": str(out.get("critique_directive", "")).strip(),
-            "revision_directive": str(out.get("revision_directive", "")).strip(),
-        }
+        try:
+            packet = build_soul_packet(soul_data)
+            out = self._chat_json(
+                "Return strict JSON only: "
+                "{\"vision_directive\": string, \"critique_directive\": string, \"revision_directive\": string}.",
+                (
+                    INTENT_WEIGHT_GUIDANCE
+                    + TIER_GUIDANCE_TEXT
+                    + "vision_directive should push distinct composition/motif from recent works.\n"
+                    + "critique_directive should evaluate alignment with soul, not generic quality alone.\n"
+                    + "revision_directive should explain how identity should evolve from outcome.\n"
+                    + f"soul_packet:{packet}"
+                ),
+            )
+            return {
+                "vision_directive": str(out.get("vision_directive", "")).strip(),
+                "critique_directive": str(out.get("critique_directive", "")).strip(),
+                "revision_directive": str(out.get("revision_directive", "")).strip(),
+            }
+        except Exception as exc:
+            raise HostedCallError(f"Ollama run-intent generation failed: {exc}") from exc
 
     def propose_state_revision(self, soul_data: Dict, creation_result: Dict) -> Dict:
-        packet = build_soul_packet(soul_data)
-        out = self._chat_json(
-            "Return strict JSON only with keys: "
-            "{\"obsession\": string, "
-            "\"personality_mode\": \"keep|append|replace\", "
-            "\"personality_traits\": [string], "
-            "\"text_memory_action\": \"none|add|edit_last|delete_last\", "
-            "\"text_memory\": {\"content\": string, \"importance\": \"critical|high|medium|low\", \"tags\": [string]}, "
-            "\"artwork_memory_action\": \"none|annotate_last|delete_last\", "
-            "\"artwork_note\": string}.",
-            (
-                REVISION_WEIGHT_GUIDANCE
-                + TIER_GUIDANCE_TEXT
-                + "If creation_result.score <= 7 or creation_result.worthy is false, identity drift is required: "
-                + "change obsession and/or change personality traits materially (not just restating current values).\n"
-                + f"soul_packet:{packet}\ncreation_result:{creation_result}"
-            ),
-        )
-        return out if isinstance(out, dict) else {}
+        try:
+            packet = build_soul_packet(soul_data)
+            out = self._chat_json(
+                "Return strict JSON only with keys: "
+                "{\"obsession\": string, "
+                "\"personality_mode\": \"keep|append|replace\", "
+                "\"personality_traits\": [string], "
+                "\"text_memory_action\": \"none|add|edit_last|delete_last\", "
+                "\"text_memory\": {\"content\": string, \"importance\": \"critical|high|medium|low\", \"tags\": [string]}, "
+                "\"artwork_memory_action\": \"none|annotate_last|delete_last\", "
+                "\"artwork_note\": string}.",
+                (
+                    REVISION_WEIGHT_GUIDANCE
+                    + TIER_GUIDANCE_TEXT
+                    + "If creation_result.score <= 7 or creation_result.worthy is false, identity drift is required: "
+                    + "change obsession and/or change personality traits materially (not just restating current values).\n"
+                    + f"soul_packet:{packet}\ncreation_result:{creation_result}"
+                ),
+            )
+            return out if isinstance(out, dict) else {}
+        except Exception as exc:
+            raise HostedCallError(f"Ollama state revision failed: {exc}") from exc
 
 
 class HostedLLMBackend(LLMBackend):
@@ -875,7 +860,6 @@ class HostedLLMBackend(LLMBackend):
         self.temperature = temperature
         self.allow_fallback = allow_fallback
         self.trace_prompts = trace_prompts
-        self.mock_fallback = MockLLMBackend()
 
     def _http_json(self, url: str, payload: Dict, headers: Dict) -> Dict:
         return _post_json_with_retry(url=url, payload=payload, headers=headers, timeout=45)
@@ -935,27 +919,21 @@ class HostedLLMBackend(LLMBackend):
             out = self._chat_json("Return strict JSON: score (1-10), feedback.", f"vision:{vision}\niteration:{iteration}\ncritique_frame:{critique_frame}", 180, image_path)
             return {"score": max(1, min(10, int(out.get("score", 0)))), "feedback": str(out.get("feedback", "Needs refinement."))}
         except Exception as exc:
-            if not self.allow_fallback:
-                raise HostedCallError(f"Hosted critique failed: {exc}") from exc
-            return self.mock_fallback.critique(image_path, vision, iteration)
+            raise HostedCallError(f"Hosted critique failed: {exc}") from exc
 
     def judge_worthiness(self, image_path: str, score: int, vision: str, critique_frame: str = "") -> bool:
         try:
             out = self._chat_json("Return strict JSON: worthy(boolean).", f"vision:{vision}\nscore:{score}\ncritique_frame:{critique_frame}", 120, image_path)
             return bool(out.get("worthy", score >= 7))
         except Exception as exc:
-            if not self.allow_fallback:
-                raise HostedCallError(f"Hosted judgment failed: {exc}") from exc
-            return self.mock_fallback.judge_worthiness(image_path, score, vision)
+            raise HostedCallError(f"Hosted judgment failed: {exc}") from exc
 
     def generate_text_memory(self, soul_data: Dict, creation_result: Dict, trigger_reason: str) -> Dict:
         try:
             out = self._chat_json("Return strict JSON: content, importance, tags.", f"trigger:{trigger_reason}\nresult:{creation_result}", 220)
             return safe_text_memory(out, soul_data)
         except Exception as exc:
-            if not self.allow_fallback:
-                raise HostedCallError(f"Hosted memory generation failed: {exc}") from exc
-            return self.mock_fallback.generate_text_memory(soul_data, creation_result, trigger_reason)
+            raise HostedCallError(f"Hosted memory generation failed: {exc}") from exc
 
     def generate_ascii_art(self, prompt: str, iteration: int, creation_id: int, width: int = 0, height: int = 0) -> str:
         try:
@@ -972,9 +950,7 @@ class HostedLLMBackend(LLMBackend):
                 550,
             )
         except Exception as exc:
-            if not self.allow_fallback:
-                raise HostedCallError(f"Hosted ASCII generation failed: {exc}") from exc
-            return self.mock_fallback.generate_ascii_art(prompt, iteration, creation_id, width, height)
+            raise HostedCallError(f"Hosted ASCII generation failed: {exc}") from exc
 
     def generate_identity(self, current_name: str) -> Dict:
         try:
@@ -995,9 +971,7 @@ class HostedLLMBackend(LLMBackend):
                 raise ValueError("empty obsession")
             return {"name": name, "personality_traits": clean_traits, "current_obsession": obsession}
         except Exception as exc:
-            if not self.allow_fallback:
-                raise HostedCallError(f"Hosted identity generation failed: {exc}") from exc
-            return self.mock_fallback.generate_identity(current_name)
+            raise HostedCallError(f"Hosted identity generation failed: {exc}") from exc
 
     def generate_vision_fallback(self, soul: Dict) -> str:
         try:
@@ -1021,9 +995,7 @@ class HostedLLMBackend(LLMBackend):
                 raise ValueError("empty vision")
             return vision
         except Exception as exc:
-            if not self.allow_fallback:
-                raise HostedCallError(f"Hosted vision fallback failed: {exc}") from exc
-            return self.mock_fallback.generate_vision_fallback(soul)
+            raise HostedCallError(f"Hosted vision fallback failed: {exc}") from exc
 
     def generate_run_intent(self, soul_data: Dict) -> Dict:
         try:
@@ -1046,9 +1018,7 @@ class HostedLLMBackend(LLMBackend):
                 "revision_directive": str(out.get("revision_directive", "")).strip(),
             }
         except Exception as exc:
-            if not self.allow_fallback:
-                raise HostedCallError(f"Hosted run intent generation failed: {exc}") from exc
-            return self.mock_fallback.generate_run_intent(soul_data)
+            raise HostedCallError(f"Hosted run intent generation failed: {exc}") from exc
 
     def propose_state_revision(self, soul_data: Dict, creation_result: Dict) -> Dict:
         try:
@@ -1067,9 +1037,7 @@ class HostedLLMBackend(LLMBackend):
             )
             return out if isinstance(out, dict) else {}
         except Exception as exc:
-            if not self.allow_fallback:
-                raise HostedCallError(f"Hosted state revision failed: {exc}") from exc
-            return self.mock_fallback.propose_state_revision(soul_data, creation_result)
+            raise HostedCallError(f"Hosted state revision failed: {exc}") from exc
 
 
 class VisionBackend:

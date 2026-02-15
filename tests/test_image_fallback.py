@@ -108,3 +108,12 @@ def test_ascii_backend_retries_and_accepts_non_text_variant(tmp_path: Path):
     text = out.read_text(encoding="utf-8")
     assert "renderer: llm" in text
     assert llm.calls >= 2
+
+
+def test_ascii_backend_without_llm_backend_fails_closed(tmp_path: Path):
+    backend = AsciiImageBackend(tmp_path, llm_backend=None, ascii_size="40x20")
+    try:
+        backend.generate("no-llm", 0, 6)
+        assert False, "Expected HostedCallError when no LLM backend is available for ASCII rendering."
+    except HostedCallError:
+        pass

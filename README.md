@@ -6,7 +6,7 @@ A multi-artist CLI system where each artist recursively:
 - critiques and judges output
 - updates memories, personality, and obsession over time
 
-The project supports hosted providers (Gemini/OpenAI/Anthropic), local Ollama models, and robust fallback behavior.
+The project supports hosted providers (Gemini/OpenAI/Anthropic), local Ollama models, and LLM-driven ASCII fallback behavior.
 
 ## Key Features
 
@@ -97,9 +97,9 @@ python recursive_artist_agent.py check-backends --artist qwen_artist --probe
 
 ## Runtime Policies
 
-- `strict`: requires hosted backends where configured; no hosted fallback unless explicitly configured via fallback mode
-- `hybrid`: hosted first, with local/mock fallback paths where available
-- `offline`: enforces fully local execution (`vision=ollama`, `llm=ollama`, `image=ascii/mock`)
+- `strict`: disallows deterministic local vision and all mock backends
+- `hybrid`: hosted-first where configured, with explicit ASCII fallback support for image generation
+- `offline`: enforces fully local execution (`vision=ollama`, `llm=ollama`, `image=ascii`)
 
 ## ASCII Fallback
 

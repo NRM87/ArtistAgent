@@ -69,3 +69,27 @@ def test_invalid_image_capability_rejected():
     )
     with pytest.raises(ValueError):
         validate_backend_choices(args)
+
+
+def test_mock_image_backend_rejected_for_run():
+    args = argparse.Namespace(
+        run_policy="hybrid",
+        vision_backend="ollama",
+        llm_backend="ollama",
+        image_backend="mock",
+        image_fallback="ascii",
+    )
+    with pytest.raises(ValueError):
+        validate_backend_choices(args)
+
+
+def test_mock_image_fallback_rejected():
+    args = argparse.Namespace(
+        run_policy="hybrid",
+        vision_backend="ollama",
+        llm_backend="ollama",
+        image_backend="gemini",
+        image_fallback="mock",
+    )
+    with pytest.raises(ValueError):
+        validate_backend_choices(args)
