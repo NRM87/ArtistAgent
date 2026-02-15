@@ -1,0 +1,11 @@
+.env
+__pycache__/
+temp/
+_numbered.txt
+.pytest_cache/
+artists/*/gallery/
+masterpieces/
+artists/*/temp/
+artists/*
+!artists/.gitkeep
+

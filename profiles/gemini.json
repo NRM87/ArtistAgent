@@ -1,0 +1,12 @@
+{
+  "run_policy": "strict",
+  "vision_backend": "gemini",
+  "vision_model": "gemini-2.0-flash",
+  "vision_temperature": 0.4,
+  "llm_backend": "gemini",
+  "llm_model": "gemini-2.0-flash",
+  "llm_temperature": 0.2,
+  "image_backend": "gemini",
+  "image_model": "gemini-2.0-flash-exp-image-generation",
+  "image_size": "1024x1024"
+}

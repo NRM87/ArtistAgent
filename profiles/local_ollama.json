@@ -1,0 +1,17 @@
+﻿{
+  "run_policy": "offline",
+  "vision_backend": "ollama",
+  "vision_model": "qwen2.5:3b",
+  "vision_temperature": 0.7,
+  "llm_backend": "ollama",
+  "llm_model": "qwen2.5:3b",
+  "llm_temperature": 0.6,
+  "ollama_base_url": "http://localhost:11434",
+  "image_backend": "ascii",
+  "image_model": "",
+  "image_size": "1024x1024",
+  "image_fallback": "ascii",
+  "ascii_size": "200x80",
+  "trace_revision": false,
+  "trace_prompts": false
+}
