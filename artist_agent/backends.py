@@ -34,6 +34,7 @@ TIER_GUIDANCE_TEXT = (
 SOUL_CONTEXT_GUIDANCE = (
     "Ground decisions in the artist's personality traits, obsession, text memories, artwork memories, and recent history.\n"
 )
+FIRST_PERSON_HINT = "Use first-person voice (I/me/my) when expressing artistic intent, critique, and reflection.\n"
 
 
 def _post_json_with_retry(url: str, payload: Dict, headers: Dict, timeout: int, attempts: int = 5) -> Dict:
@@ -154,6 +155,20 @@ def _extract_block(text: str, start_marker: str, end_marker: str) -> str:
     return raw[s:e].strip()
 
 
+def _normalize_prompt_text(text: str) -> str:
+    value = str(text).replace("\r\n", "\n").replace("\r", "\n").strip()
+    value = re.sub(r"(?im)^\s*image_prompt\s*[:=-]\s*", "", value).strip()
+    # Keep multiline prompts readable but collapse redundant blank runs.
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+        value = value[1:-1].strip()
+    return value
+
+
+def _contains_first_person(text: str) -> bool:
+    return bool(re.search(r"\b(i|me|my|mine|myself)\b", str(text), flags=re.I))
+
+
 def _extract_image_prompt(raw: str, current_prompt: str) -> str:
     text = str(raw)
     for start, end in (
@@ -163,12 +178,12 @@ def _extract_image_prompt(raw: str, current_prompt: str) -> str:
     ):
         block = _extract_block(text, start, end)
         if block:
-            return block
+            return _normalize_prompt_text(block)
 
     for label in ("image_prompt", "revised_prompt", "vision_refined"):
         value = _extract_labeled_value(text, label)
         if value:
-            return value
+            return _normalize_prompt_text(value)
 
     # Last-resort fallback: accept a single clean line only.
     first = _first_nonempty_line(text)
@@ -185,7 +200,7 @@ def _extract_image_prompt(raw: str, current_prompt: str) -> str:
                 "keep continuity",
             )
         ):
-            return first
+            return _normalize_prompt_text(first)
     return current_prompt
 
 
@@ -855,7 +870,7 @@ class OllamaLLMBackend(LLMBackend):
             raw = self._chat_text(
                 "Evaluate this artwork and respond using exactly two lines:\n"
                 "SCORE: <integer 1-10>\n"
-                "FEEDBACK: <one concise critique sentence>",
+                "FEEDBACK: <one concise critique sentence in first person>",
                 f"vision:{vision}\niteration:{iteration}\ncritique_frame:{critique_frame}",
                 image_path=image_path,
             )
@@ -872,11 +887,18 @@ class OllamaLLMBackend(LLMBackend):
             feedback = _extract_labeled_value(raw, "feedback") or _first_nonempty_line(raw)
             if not feedback or feedback.isdigit():
                 feedback_raw = self._chat_text(
-                    "Respond with exactly one concise critique sentence only.",
+                    "Respond with exactly one concise critique sentence in first person only.",
                     f"vision:{vision}\niteration:{iteration}\nscore:{parsed_score}\ncritique_frame:{critique_frame}",
                     image_path=image_path,
                 )
                 feedback = _first_nonempty_line(feedback_raw)
+            if feedback and not _contains_first_person(feedback):
+                fp_raw = self._chat_text(
+                    "Rewrite in first person only. Return one sentence.",
+                    f"feedback:{feedback}",
+                    image_path=image_path,
+                )
+                feedback = _first_nonempty_line(fp_raw) or feedback
             if not feedback:
                 raise ValueError("Could not parse critique feedback.")
             return {"score": parsed_score, "feedback": feedback}
@@ -901,12 +923,15 @@ class OllamaLLMBackend(LLMBackend):
         try:
             raw = self._chat_text(
                 "Generate one text memory and respond using lines:\n"
-                "CONTENT: <text>\n"
+                "CONTENT: <first-person text>\n"
                 "IMPORTANCE: <critical|high|medium|low>\n"
                 "TAGS: <comma separated tags>",
                 f"trigger:{trigger_reason}\nresult:{creation_result}",
             )
             content = _extract_labeled_value(raw, "content") or _first_nonempty_line(raw)
+            if content and not _contains_first_person(content):
+                fp_raw = self._chat_text("Rewrite this memory in first person only.", f"content:{content}")
+                content = _first_nonempty_line(fp_raw) or content
             importance = _normalize_choice(_extract_labeled_value(raw, "importance"), ["critical", "high", "medium", "low"], "medium")
             tags_raw = _extract_labeled_value(raw, "tags")
             tags = _split_list_text(tags_raw, max_items=6)
@@ -966,15 +991,19 @@ class OllamaLLMBackend(LLMBackend):
             recent = [m.get("vision", "") for m in memories[-8:]]
             packet = build_soul_packet(soul)
             text = self._chat_text(
-                "Return exactly one concise art vision sentence. No JSON. No bullet points.",
+                "Return exactly one concise art vision sentence in first person. No JSON. No bullet points.",
                 (
                     SOUL_CONTEXT_GUIDANCE
+                    + FIRST_PERSON_HINT
                     + TIER_GUIDANCE_TEXT
                     + f"soul_packet:{packet}\npreferences:{prefs[-8:]}\nprinciples:{principles[-8:]}\ninstructions:{instructions[-8:]}\nrecent:{recent}\n"
                     + "Prefer meaningful variation in composition while preserving continuity with the artist's soul."
                 ),
             )
             vision = text.strip().strip('"').splitlines()[0].strip()
+            if vision and not _contains_first_person(vision):
+                rewrite = self._chat_text("Rewrite this vision in first person. One sentence only.", f"vision:{vision}")
+                vision = _first_nonempty_line(rewrite) or vision
             if not vision:
                 raise HostedCallError("LLM vision fallback returned empty vision.")
             return vision
@@ -985,22 +1014,28 @@ class OllamaLLMBackend(LLMBackend):
         try:
             packet = build_soul_packet(soul_data)
             context = (
-                SOUL_CONTEXT_GUIDANCE
+                FIRST_PERSON_HINT
+                + SOUL_CONTEXT_GUIDANCE
                 + TIER_GUIDANCE_TEXT
                 + f"soul_packet:{packet}"
             )
             out = self._chat_text(
                 "Respond using three lines:\n"
-                "VISION_DIRECTIVE: <text>\n"
-                "CRITIQUE_DIRECTIVE: <text>\n"
-                "REVISION_DIRECTIVE: <text>",
+                "VISION_DIRECTIVE: <first-person text, <= 140 chars>\n"
+                "CRITIQUE_DIRECTIVE: <first-person text, <= 140 chars>\n"
+                "REVISION_DIRECTIVE: <first-person text, <= 140 chars>",
                 context,
             )
-            return {
-                "vision_directive": _extract_labeled_value(out, "vision_directive"),
-                "critique_directive": _extract_labeled_value(out, "critique_directive"),
-                "revision_directive": _extract_labeled_value(out, "revision_directive"),
-            }
+            vd = _extract_labeled_value(out, "vision_directive")
+            cd = _extract_labeled_value(out, "critique_directive")
+            rd = _extract_labeled_value(out, "revision_directive")
+            if vd and not _contains_first_person(vd):
+                vd = f"I will {vd[:120].lstrip()}"
+            if cd and not _contains_first_person(cd):
+                cd = f"I will {cd[:120].lstrip()}"
+            if rd and not _contains_first_person(rd):
+                rd = f"I will {rd[:120].lstrip()}"
+            return {"vision_directive": vd, "critique_directive": cd, "revision_directive": rd}
         except Exception as exc:
             raise HostedCallError(f"Ollama run-intent generation failed: {exc}") from exc
 
@@ -1087,7 +1122,7 @@ class OllamaLLMBackend(LLMBackend):
             revision["text_memory_action"] = text_action
             if text_action in ("add", "edit_last"):
                 text_mem_raw = self._chat_text(
-                    "Respond with lines:\nCONTENT: <text>\nIMPORTANCE: <critical|high|medium|low>\nTAGS: <comma separated tags>",
+                    "Respond with lines:\nCONTENT: <first-person text>\nIMPORTANCE: <critical|high|medium|low>\nTAGS: <comma separated tags>",
                     context,
                 )
                 revision["text_memory"] = {
@@ -1104,7 +1139,7 @@ class OllamaLLMBackend(LLMBackend):
             revision["artwork_memory_action"] = artwork_action
             if artwork_action == "annotate_last":
                 note_raw = self._chat_text(
-                    "Provide one concise artwork note line.",
+                    "Provide one concise first-person artwork note line.",
                     context,
                 )
                 revision["artwork_note"] = _first_nonempty_line(note_raw)
@@ -1178,7 +1213,7 @@ class HostedLLMBackend(LLMBackend):
             raw = self._chat_text(
                 "Evaluate this artwork and respond using exactly two lines:\n"
                 "SCORE: <integer 1-10>\n"
-                "FEEDBACK: <one concise critique sentence>",
+                "FEEDBACK: <one concise critique sentence in first person>",
                 f"vision:{vision}\niteration:{iteration}\ncritique_frame:{critique_frame}",
                 220,
                 image_path,
@@ -1197,12 +1232,20 @@ class HostedLLMBackend(LLMBackend):
             feedback = _extract_labeled_value(raw, "feedback") or _first_nonempty_line(raw)
             if not feedback or feedback.isdigit():
                 feedback_raw = self._chat_text(
-                    "Respond with exactly one concise critique sentence only.",
+                    "Respond with exactly one concise critique sentence in first person only.",
                     f"vision:{vision}\niteration:{iteration}\nscore:{parsed_score}\ncritique_frame:{critique_frame}",
                     160,
                     image_path,
                 )
                 feedback = _first_nonempty_line(feedback_raw)
+            if feedback and not _contains_first_person(feedback):
+                fp_raw = self._chat_text(
+                    "Rewrite in first person only. Return one sentence.",
+                    f"feedback:{feedback}",
+                    140,
+                    image_path,
+                )
+                feedback = _first_nonempty_line(fp_raw) or feedback
             if not feedback:
                 raise ValueError("Could not parse critique feedback.")
             return {"score": parsed_score, "feedback": feedback}
@@ -1228,13 +1271,16 @@ class HostedLLMBackend(LLMBackend):
         try:
             raw = self._chat_text(
                 "Generate one text memory and respond using lines:\n"
-                "CONTENT: <text>\n"
+                "CONTENT: <first-person text>\n"
                 "IMPORTANCE: <critical|high|medium|low>\n"
                 "TAGS: <comma separated tags>",
                 f"trigger:{trigger_reason}\nresult:{creation_result}",
                 240,
             )
             content = _extract_labeled_value(raw, "content") or _first_nonempty_line(raw)
+            if content and not _contains_first_person(content):
+                fp_raw = self._chat_text("Rewrite this memory in first person only.", f"content:{content}", 140)
+                content = _first_nonempty_line(fp_raw) or content
             importance = _normalize_choice(_extract_labeled_value(raw, "importance"), ["critical", "high", "medium", "low"], "medium")
             tags_raw = _extract_labeled_value(raw, "tags")
             tags = _split_list_text(tags_raw, max_items=6)
@@ -1296,9 +1342,10 @@ class HostedLLMBackend(LLMBackend):
             recent = [m.get("vision", "") for m in memories[-8:]]
             packet = build_soul_packet(soul)
             text = self._chat_text(
-                "Return exactly one concise art vision sentence. No JSON. No bullet points.",
+                "Return exactly one concise art vision sentence in first person. No JSON. No bullet points.",
                 (
                     SOUL_CONTEXT_GUIDANCE
+                    + FIRST_PERSON_HINT
                     + TIER_GUIDANCE_TEXT
                     + f"soul_packet:{packet}\npreferences:{prefs[-8:]}\nprinciples:{principles[-8:]}\ninstructions:{instructions[-8:]}\nrecent:{recent}\n"
                     + "Prefer meaningful variation in composition while preserving continuity with the artist's soul."
@@ -1306,6 +1353,9 @@ class HostedLLMBackend(LLMBackend):
                 90,
             )
             vision = text.strip().strip('"').splitlines()[0].strip()
+            if vision and not _contains_first_person(vision):
+                rewrite = self._chat_text("Rewrite this vision in first person. One sentence only.", f"vision:{vision}", 90)
+                vision = _first_nonempty_line(rewrite) or vision
             if not vision:
                 raise ValueError("empty vision")
             return vision
@@ -1317,21 +1367,27 @@ class HostedLLMBackend(LLMBackend):
             packet = build_soul_packet(soul_data)
             out = self._chat_text(
                 "Respond using three lines:\n"
-                "VISION_DIRECTIVE: <text>\n"
-                "CRITIQUE_DIRECTIVE: <text>\n"
-                "REVISION_DIRECTIVE: <text>",
+                "VISION_DIRECTIVE: <first-person text, <= 140 chars>\n"
+                "CRITIQUE_DIRECTIVE: <first-person text, <= 140 chars>\n"
+                "REVISION_DIRECTIVE: <first-person text, <= 140 chars>",
                 (
-                    SOUL_CONTEXT_GUIDANCE
+                    FIRST_PERSON_HINT
+                    + SOUL_CONTEXT_GUIDANCE
                     + TIER_GUIDANCE_TEXT
                     + f"soul_packet:{packet}"
                 ),
                 320,
             )
-            return {
-                "vision_directive": _extract_labeled_value(out, "vision_directive"),
-                "critique_directive": _extract_labeled_value(out, "critique_directive"),
-                "revision_directive": _extract_labeled_value(out, "revision_directive"),
-            }
+            vd = _extract_labeled_value(out, "vision_directive")
+            cd = _extract_labeled_value(out, "critique_directive")
+            rd = _extract_labeled_value(out, "revision_directive")
+            if vd and not _contains_first_person(vd):
+                vd = f"I will {vd[:120].lstrip()}"
+            if cd and not _contains_first_person(cd):
+                cd = f"I will {cd[:120].lstrip()}"
+            if rd and not _contains_first_person(rd):
+                rd = f"I will {rd[:120].lstrip()}"
+            return {"vision_directive": vd, "critique_directive": cd, "revision_directive": rd}
         except Exception as exc:
             raise HostedCallError(f"Hosted run intent generation failed: {exc}") from exc
 
@@ -1424,7 +1480,7 @@ class HostedLLMBackend(LLMBackend):
             revision["text_memory_action"] = text_action
             if text_action in ("add", "edit_last"):
                 text_mem_raw = self._chat_text(
-                    "Respond with lines:\nCONTENT: <text>\nIMPORTANCE: <critical|high|medium|low>\nTAGS: <comma separated tags>",
+                    "Respond with lines:\nCONTENT: <first-person text>\nIMPORTANCE: <critical|high|medium|low>\nTAGS: <comma separated tags>",
                     context,
                     260,
                 )
@@ -1443,7 +1499,7 @@ class HostedLLMBackend(LLMBackend):
             revision["artwork_memory_action"] = artwork_action
             if artwork_action == "annotate_last":
                 note_raw = self._chat_text(
-                    "Provide one concise artwork note line.",
+                    "Provide one concise first-person artwork note line.",
                     context,
                     180,
                 )
@@ -1481,8 +1537,9 @@ class OllamaVisionBackend(VisionBackend):
         recent_visions = [m.get("vision", "") for m in memories[-8:]]
         prompt = (
             "Generate one concise art vision sentence. "
-            "Do not output JSON. Keep it under 18 words.\n\n"
+            "Use first-person voice (I/my). Do not output JSON. Keep it under 18 words.\n\n"
             + SOUL_CONTEXT_GUIDANCE
+            + FIRST_PERSON_HINT
             + TIER_GUIDANCE_TEXT
             + f"soul_packet:{packet}\n"
             + f"preferences:{preferences[-8:]}\n"
@@ -1494,6 +1551,15 @@ class OllamaVisionBackend(VisionBackend):
         try:
             _trace_prompt(self.trace_prompts, "vision.generate", self.provider, self.model, "Generate one concise art vision sentence.", prompt)
             candidate = _ollama_generate_text(self.base_url, self.model, prompt, self.temperature, timeout=60).strip().strip('"').replace("\n", " ")
+            if candidate and not _contains_first_person(candidate):
+                rewrite = _ollama_generate_text(
+                    self.base_url,
+                    self.model,
+                    f"Rewrite in first person only (one sentence): {candidate}",
+                    self.temperature,
+                    timeout=40,
+                ).strip().strip('"').replace("\n", " ")
+                candidate = rewrite or candidate
             _, _, _, prioritized = infer_guidance(text_memories)
             if memory_collision(parse_vision(candidate), memories[-5:], prioritized):
                 raise HostedCallError("Ollama vision collided with recent pattern.")
@@ -1545,12 +1611,16 @@ class HostedVisionBackend(VisionBackend):
         try:
             candidate = self._chat_text(
                 "Generate one concise art vision sentence.",
-                SOUL_CONTEXT_GUIDANCE
+                FIRST_PERSON_HINT
+                + SOUL_CONTEXT_GUIDANCE
                 + TIER_GUIDANCE_TEXT
                 + f"soul_packet:{packet}\npreferences:{preferences[-8:]}\nprinciples:{principles[-8:]}\ninstructions:{instructions[-8:]}\nrecent:{recent_visions}\n"
                 + "Prefer subtle variation while preserving continuity with the artist's soul.",
                 90,
             ).strip().strip('"').replace("\n", " ")
+            if candidate and not _contains_first_person(candidate):
+                rewrite = self._chat_text("Rewrite in first person only, one sentence.", f"vision:{candidate}", 90).strip().strip('"').replace("\n", " ")
+                candidate = rewrite or candidate
             _, _, _, prioritized = infer_guidance(text_memories)
             if memory_collision(parse_vision(candidate), memories[-5:], prioritized):
                 raise HostedCallError("Hosted vision collided with recent pattern.")

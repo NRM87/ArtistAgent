@@ -110,7 +110,7 @@ def build_critique_frame(soul: Dict, run_intent: Dict) -> str:
         f"artwork_memories:{art_mem}\n"
         f"recent_history:{history}\n"
         f"critique_directive:{str(run_intent.get('critique_directive', '')).strip()}\n"
-        "Use this context for subjective evaluation according to the artist's own values."
+        "Use this context for subjective evaluation according to the artist's own values. Respond in first person."
     )
 
 

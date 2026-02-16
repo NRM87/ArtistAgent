@@ -2,8 +2,9 @@
 
 A multi-artist CLI system where each artist recursively:
 - generates a vision
+- runs iterative attempts with a mutable image prompt
 - creates an artifact (image or ASCII fallback)
-- critiques and judges output
+- critiques and judges output in first-person voice
 - updates memories, personality, and obsession over time
 
 The project supports hosted providers (Gemini/OpenAI/Anthropic), local Ollama models, and LLM-driven ASCII fallback behavior.
@@ -15,6 +16,9 @@ The project supports hosted providers (Gemini/OpenAI/Anthropic), local Ollama mo
 - CLI commands for setup, creation, configuration, running, and health checks
 - Local Ollama support for vision + LLM reasoning
 - LLM-driven ASCII fallback with enforced canvas size
+- Fixed run vision with iterative image-prompt refinement per run
+- Tolerant labeled-field parsing for weak local models (no strict JSON dependency in loop decisions)
+- First-person artist voice for vision, critique, and reflection
 - Stale lock recovery for interrupted runs
 - Artwork gallery storage under each artist (`gallery/`)
 
@@ -108,6 +112,18 @@ If image generation fails and `image_fallback=ascii`:
 - output is hard-enforced to exact `ascii_size` (`WxH`, default `160x60`)
 - artifact is written as `.txt` and can be preserved in the artist gallery
 
+## Run Workflow
+
+Per run:
+1. Generate one run vision from soul context (personality, obsession, memories, history).
+2. Keep that run vision fixed for the entire run.
+3. Iterate up to 5 attempts:
+   - generate image from current iteration image prompt
+   - critique/judge from artist model
+   - refine only the iteration image prompt for next attempt
+4. Persist best artifact + tier (`masterpiece` / `study` / `failure`).
+5. Reflect and optionally edit soul fields (obsession, traits, memories).
+
 ## Ollama Setup
 
 Install and run Ollama, then pull a model:
@@ -133,7 +149,7 @@ python -m pytest -q
 Compile-only sanity check:
 
 ```powershell
-python -m py_compile recursive_artist_agent.py artist_agent/*.py tests/*.py
+python -m compileall artist_agent tests
 ```
 
 ## Troubleshooting

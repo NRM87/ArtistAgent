@@ -7,7 +7,7 @@ from .memory import consolidate_text_memories, safe_text_memory
 MAX_OBSESSION_CHARS = 200
 MAX_TRAIT_CHARS = 80
 MAX_REVISION_NOTE_CHARS = 300
-MAX_DIRECTIVE_CHARS = 240
+MAX_DIRECTIVE_CHARS = 160
 MAX_TRAITS = 10
 
 

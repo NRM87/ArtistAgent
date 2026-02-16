@@ -24,10 +24,11 @@ Run sequence in `artist_agent/cycle.py`:
 6. Acquire per-artist lock
 7. Build backends (vision, llm, image)
 8. Load and apply artist state + manifest
-9. Generate vision -> prompt -> iterative creation/critique loop
-10. Judge worthiness, update memories/personality/obsession
-11. Persist soul and cleanup temp
-12. Release lock
+9. Generate fixed run vision from soul context
+10. Iterate creation loop: image prompt -> image generation -> critique -> image prompt refinement
+11. Judge worthiness, update memories/personality/obsession
+12. Persist soul and cleanup temp
+13. Release lock
 
 ## Module Responsibilities
 
@@ -61,6 +62,8 @@ Run sequence in `artist_agent/cycle.py`:
   - llm: hosted, ollama
   - image: hosted, ascii
   - fallback: LLM-generated ASCII with deterministic canvas enforcement
+- Structured text-field prompting/parsing for weak-model robustness (loop-critical actions avoid strict JSON contracts).
+- First-person voice guidance for self-reflection pathways (vision/critique/memory/revision text).
 
 `artist_agent/memory.py`
 - Vision parsing/generation rules, memory consolidation, evolution heuristics.
@@ -105,9 +108,18 @@ Important distinction:
 - `strict` must reject local/mock core backends as configured.
 - Runtime should fail closed on LLM failures (no hidden deterministic critique fallback).
 
-5. Fallback consistency
+5. Run vision contract
+- The run vision is generated once at run start and remains fixed through iterations.
+- Iterative refinement modifies only the per-iteration image prompt.
+- Do not reintroduce iteration-time vision rewriting.
+
+6. Fallback consistency
 - ASCII fallback should remain model-aware and canvas-enforced.
 - Do not reintroduce template/deterministic ASCII rendering.
+
+7. Voice contract
+- Artist-facing reflective language should remain first-person where feasible (vision/critique/memory notes).
+- Avoid third-person self-reference in generated self-reflection text.
 
 ## Extension Playbook
 
@@ -136,7 +148,7 @@ Adding a new command:
 
 2. `backends.py` parsing
 - Provider response formats drift; parsing must be defensive.
-- Prefer strict JSON instructions and fallback behavior.
+- Prefer labeled-field prompts with tolerant parsing and bounded retries.
 - Keep fail-closed behavior for critique/judgment/revision paths.
 
 3. Profile drift
