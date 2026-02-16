@@ -177,3 +177,4 @@ Gemini `429 RESOURCE_EXHAUSTED`:
 For architecture and extension guidance, see:
 
 - `docs/AGENT_ONBOARDING.md`
+- `TODO.md`
