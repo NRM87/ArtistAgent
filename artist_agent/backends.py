@@ -1,4 +1,4 @@
-﻿import base64
+import base64
 import hashlib
 import json
 import re
@@ -17,7 +17,6 @@ from .memory import (
     assign_importance,
     infer_guidance,
     memory_collision,
-    next_text_memory_id,
     parse_vision,
     safe_text_memory,
 )
@@ -32,9 +31,9 @@ TIER_GUIDANCE_TEXT = (
     "Use artwork tiers intentionally: masterpieces reinforce strengths, studies suggest experiments, "
     "failures indicate pitfalls to avoid repeating.\n"
 )
-VISION_WEIGHT_GUIDANCE = "Weighting guidance: personality 30%, obsession 35%, text memories 20%, artwork/history 15%.\n"
-INTENT_WEIGHT_GUIDANCE = "Use this weighting: personality 25%, obsession 30%, text memories 25%, artwork + history 20%.\n"
-REVISION_WEIGHT_GUIDANCE = "Weighting guidance for revision: obsession 35%, personality 25%, text memories 20%, artwork/history 20%.\n"
+SOUL_CONTEXT_GUIDANCE = (
+    "Ground decisions in the artist's personality traits, obsession, text memories, artwork memories, and recent history.\n"
+)
 
 
 def _post_json_with_retry(url: str, payload: Dict, headers: Dict, timeout: int, attempts: int = 5) -> Dict:
@@ -71,20 +70,123 @@ def _post_json_with_retry(url: str, payload: Dict, headers: Dict, timeout: int, 
     raise RuntimeError("Unknown request failure")
 
 
-def parse_json_object(text: str) -> Dict:
-    raw = text.strip()
-    try:
-        obj = json.loads(raw)
-        if isinstance(obj, dict):
-            return obj
-    except Exception:
-        pass
-    match = re.search(r"\{.*\}", raw, flags=re.S)
+def _first_nonempty_line(text: str) -> str:
+    for ln in str(text).replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        v = ln.strip()
+        if v:
+            return v
+    return ""
+
+
+def _extract_labeled_value(text: str, label: str) -> str:
+    pattern = rf"(?im)^\s*{re.escape(label)}\s*[:=-]\s*(.+?)\s*$"
+    match = re.search(pattern, str(text))
     if match:
-        obj = json.loads(match.group(0))
-        if isinstance(obj, dict):
-            return obj
-    raise ValueError("Model response did not contain a valid JSON object.")
+        return str(match.group(1)).strip()
+    return ""
+
+
+def _extract_int_in_range(text: str, low: int, high: int) -> Optional[int]:
+    labeled = _extract_labeled_value(text, "score")
+    candidates = [labeled, str(text)]
+    for src in candidates:
+        for m in re.finditer(r"-?\d+", str(src)):
+            try:
+                v = int(m.group(0))
+            except Exception:
+                continue
+            if low <= v <= high:
+                return v
+    return None
+
+
+def _extract_yes_no(text: str) -> Optional[bool]:
+    labeled = _extract_labeled_value(text, "worthy")
+    probe = f"{labeled}\n{text}".lower()
+    if re.search(r"\b(true|yes|y|worthy)\b", probe):
+        return True
+    if re.search(r"\b(false|no|n|unworthy)\b", probe):
+        return False
+    return None
+
+
+def _normalize_choice(text: str, choices: List[str], default: str) -> str:
+    probe = str(text).strip().lower()
+    line = _first_nonempty_line(probe)
+    if ":" in line:
+        line = line.split(":", 1)[1].strip()
+    token = re.split(r"[\s,.;:!?\)\(]+", line)[0].strip()
+    for c in choices:
+        if token == c.lower():
+            return c
+    found = [c for c in choices if re.search(rf"\b{re.escape(c.lower())}\b", probe)]
+    if len(found) == 1:
+        return found[0]
+    return default
+
+
+def _split_list_text(text: str, max_items: int = 10) -> List[str]:
+    raw = str(text).replace("\r\n", "\n").replace("\r", "\n")
+    raw = raw.replace("|", ",").replace(";", ",")
+    parts = []
+    for line in raw.split("\n"):
+        line = re.sub(r"^\s*[-*0-9\.\)\(]+\s*", "", line).strip()
+        if not line:
+            continue
+        for token in line.split(","):
+            clean = str(token).strip()
+            if clean and clean not in parts:
+                parts.append(clean)
+            if len(parts) >= max_items:
+                return parts
+    return parts
+
+
+def _extract_block(text: str, start_marker: str, end_marker: str) -> str:
+    raw = str(text).replace("\r\n", "\n").replace("\r", "\n")
+    s = raw.find(start_marker)
+    if s < 0:
+        return ""
+    s += len(start_marker)
+    e = raw.find(end_marker, s)
+    if e < 0:
+        return ""
+    return raw[s:e].strip()
+
+
+def _extract_image_prompt(raw: str, current_prompt: str) -> str:
+    text = str(raw)
+    for start, end in (
+        ("IMAGE_PROMPT_START", "IMAGE_PROMPT_END"),
+        ("REVISED_PROMPT_START", "REVISED_PROMPT_END"),
+        ("VISION_REFINED_START", "VISION_REFINED_END"),
+    ):
+        block = _extract_block(text, start, end)
+        if block:
+            return block
+
+    for label in ("image_prompt", "revised_prompt", "vision_refined"):
+        value = _extract_labeled_value(text, label)
+        if value:
+            return value
+
+    # Last-resort fallback: accept a single clean line only.
+    first = _first_nonempty_line(text)
+    if first and "\n" not in first and len(first) <= 500:
+        lowered = first.lower()
+        if not any(
+            token in lowered
+            for token in (
+                "return only",
+                "base_prompt",
+                "revised_prompt_start",
+                "image_prompt_start",
+                "vision_refined_start",
+                "keep continuity",
+            )
+        ):
+            return first
+    return current_prompt
 
 
 def _ollama_generate_text(base_url: str, model: str, prompt: str, temperature: float, timeout: int = 60) -> str:
@@ -460,6 +562,9 @@ class AsciiImageBackend(ImageBackend):
 
         lines = []
         last_exc: Optional[Exception] = None
+        best_canvas: Optional[str] = None
+        best_warnings: List[str] = []
+        best_quality = -1.0
         for attempt in range(3):
             try:
                 # Retry with stronger anti-collapse hints for small local models.
@@ -470,26 +575,42 @@ class AsciiImageBackend(ImageBackend):
                     variant_prompt += ". Avoid repeating recent motifs; commit to a distinct composition. Absolutely no readable words, captions, labels, or notes."
                 llm_ascii = self.llm_backend.generate_ascii_art(variant_prompt, iteration, creation_id, width, height)
                 canvas = self._enforce_canvas(self._sanitize_ascii(llm_ascii), width, height)
+                warnings: List[str] = []
                 if self._contains_readable_text(canvas):
-                    raise ValueError("ASCII output contained readable text.")
-                if self._ink_ratio(canvas) < 0.006:
-                    raise ValueError("ASCII output too sparse.")
-                lines = [
-                    f"ASCII ART - creation {creation_id} iter {iteration}",
-                    f"prompt: {prompt}",
-                    "renderer: llm",
-                    f"canvas: {width}x{height}",
-                    "",
-                    "BEGIN_ASCII",
-                    canvas,
-                    "END_ASCII",
-                    "",
-                ]
-                break
+                    warnings.append("readable_text")
+                ink_ratio = self._ink_ratio(canvas)
+                if ink_ratio < 0.006:
+                    warnings.append("sparse_output")
+                # Prefer cleaner outputs, but do not hard-fail on style quality checks.
+                quality = ink_ratio
+                if "readable_text" not in warnings:
+                    quality += 1.0
+                if "sparse_output" not in warnings:
+                    quality += 0.7
+                if quality > best_quality:
+                    best_quality = quality
+                    best_canvas = canvas
+                    best_warnings = warnings
+                if not warnings:
+                    break
             except Exception as exc:
                 last_exc = exc
-        if not lines:
+
+        if best_canvas is None:
             raise HostedCallError(f"LLM ASCII rendering failed after retries ({last_exc})")
+        warning_text = ",".join(best_warnings) if best_warnings else "none"
+        lines = [
+            f"ASCII ART - creation {creation_id} iter {iteration}",
+            f"prompt: {prompt}",
+            "renderer: llm",
+            f"canvas: {width}x{height}",
+            f"quality_warnings: {warning_text}",
+            "",
+            "BEGIN_ASCII",
+            best_canvas,
+            "END_ASCII",
+            "",
+        ]
 
         path = self.temp_dir / f"img_{creation_id:04d}_iter_{iteration}.txt"
         path.write_text("\n".join(lines), encoding="utf-8")
@@ -605,6 +726,17 @@ class LLMBackend:
     def generate_run_intent(self, soul_data: Dict) -> Dict:
         raise NotImplementedError
 
+    def refine_render_prompt(
+        self,
+        current_prompt: str,
+        vision: str,
+        critique_feedback: str,
+        score: int,
+        soul_data: Dict,
+        run_intent: Optional[Dict] = None,
+    ) -> str:
+        raise NotImplementedError
+
     def propose_state_revision(self, soul_data: Dict, creation_result: Dict) -> Dict:
         raise NotImplementedError
 
@@ -673,6 +805,17 @@ class MockLLMBackend(LLMBackend):
     def generate_run_intent(self, soul_data: Dict) -> Dict:
         raise HostedCallError("Run intent requires an LLM backend, but current backend is mock.")
 
+    def refine_render_prompt(
+        self,
+        current_prompt: str,
+        vision: str,
+        critique_feedback: str,
+        score: int,
+        soul_data: Dict,
+        run_intent: Optional[Dict] = None,
+    ) -> str:
+        raise HostedCallError("Prompt refinement requires an LLM backend, but current backend is mock.")
+
     def propose_state_revision(self, soul_data: Dict, creation_result: Dict) -> Dict:
         raise HostedCallError("State revision requires an LLM backend, but current backend is mock.")
 
@@ -707,39 +850,67 @@ class OllamaLLMBackend(LLMBackend):
         _trace_prompt(self.trace_prompts, "ollama.chat", self.provider, self.model, system_prompt, user_prompt)
         return _ollama_generate_text(self.base_url, self.model, prompt, temp, timeout=timeout)
 
-    def _chat_json(self, system_prompt: str, user_prompt: str, image_path: Optional[str] = None) -> Dict:
-        raw = self._chat_text(system_prompt, user_prompt, image_path=image_path)
-        return parse_json_object(raw)
-
     def critique(self, image_path: str, vision: str, iteration: int, critique_frame: str = "") -> Dict:
         try:
-            out = self._chat_json(
-                "Return strict JSON only: {\"score\": 1-10 integer, \"feedback\": string}.",
+            raw = self._chat_text(
+                "Evaluate this artwork and respond using exactly two lines:\n"
+                "SCORE: <integer 1-10>\n"
+                "FEEDBACK: <one concise critique sentence>",
                 f"vision:{vision}\niteration:{iteration}\ncritique_frame:{critique_frame}",
                 image_path=image_path,
             )
-            return {"score": max(1, min(10, int(out.get("score", 0)))), "feedback": str(out.get("feedback", "Needs refinement."))}
+            parsed_score = _extract_int_in_range(raw, 1, 10)
+            if parsed_score is None:
+                score_raw = self._chat_text(
+                    "Respond with one integer from 1 to 10 only.",
+                    f"vision:{vision}\niteration:{iteration}",
+                    image_path=image_path,
+                )
+                parsed_score = _extract_int_in_range(score_raw, 1, 10)
+            if parsed_score is None:
+                raise ValueError("Could not parse critique score.")
+            feedback = _extract_labeled_value(raw, "feedback") or _first_nonempty_line(raw)
+            if not feedback or feedback.isdigit():
+                feedback_raw = self._chat_text(
+                    "Respond with exactly one concise critique sentence only.",
+                    f"vision:{vision}\niteration:{iteration}\nscore:{parsed_score}\ncritique_frame:{critique_frame}",
+                    image_path=image_path,
+                )
+                feedback = _first_nonempty_line(feedback_raw)
+            if not feedback:
+                raise ValueError("Could not parse critique feedback.")
+            return {"score": parsed_score, "feedback": feedback}
         except Exception as exc:
             raise HostedCallError(f"Ollama critique failed: {exc}") from exc
 
     def judge_worthiness(self, image_path: str, score: int, vision: str, critique_frame: str = "") -> bool:
         try:
-            out = self._chat_json(
-                "Return strict JSON only: {\"worthy\": true|false}.",
+            raw = self._chat_text(
+                "Decide if this artwork is worthy. Respond with one token only: YES or NO.",
                 f"vision:{vision}\nscore:{score}\ncritique_frame:{critique_frame}",
                 image_path=image_path,
             )
-            return bool(out.get("worthy", score >= 7))
+            worthy = _extract_yes_no(raw)
+            if worthy is None:
+                raise ValueError("Could not parse worthy decision.")
+            return worthy
         except Exception as exc:
             raise HostedCallError(f"Ollama judgment failed: {exc}") from exc
 
     def generate_text_memory(self, soul_data: Dict, creation_result: Dict, trigger_reason: str) -> Dict:
         try:
-            out = self._chat_json(
-                "Return strict JSON only: {\"content\": string, \"importance\": \"critical|high|medium|low\", \"tags\": [string]}.",
+            raw = self._chat_text(
+                "Generate one text memory and respond using lines:\n"
+                "CONTENT: <text>\n"
+                "IMPORTANCE: <critical|high|medium|low>\n"
+                "TAGS: <comma separated tags>",
                 f"trigger:{trigger_reason}\nresult:{creation_result}",
             )
-            return safe_text_memory(out, soul_data)
+            content = _extract_labeled_value(raw, "content") or _first_nonempty_line(raw)
+            importance = _normalize_choice(_extract_labeled_value(raw, "importance"), ["critical", "high", "medium", "low"], "medium")
+            tags_raw = _extract_labeled_value(raw, "tags")
+            tags = _split_list_text(tags_raw, max_items=6)
+            return safe_text_memory({"content": content, "importance": importance, "tags": tags}, soul_data)
         except Exception as exc:
             raise HostedCallError(f"Ollama text-memory generation failed: {exc}") from exc
 
@@ -763,18 +934,24 @@ class OllamaLLMBackend(LLMBackend):
 
     def generate_identity(self, current_name: str) -> Dict:
         try:
-            out = self._chat_json(
-                "Return strict JSON only: {\"name\": string, \"personality_traits\": [3-7 strings], \"current_obsession\": string}.",
-                f"Create a distinctive artistic identity. Current name hint: {current_name}",
+            seed = current_name.strip() if current_name.strip() else "Unnamed Artist"
+            name_raw = self._chat_text(
+                "Return exactly one artist name line only.",
+                f"Current name hint: {seed}",
             )
-            name = str(out.get("name", "")).strip() or (current_name.strip() if current_name.strip() else "Unnamed Artist")
-            traits = out.get("personality_traits", [])
-            if not isinstance(traits, list):
-                traits = []
-            clean_traits = [str(t).strip() for t in traits if str(t).strip()][:7]
+            obsession_raw = self._chat_text(
+                "Return exactly one current obsession line only.",
+                f"Artist name: {seed}",
+            )
+            traits_raw = self._chat_text(
+                "Return 3 to 7 personality traits, comma-separated. No numbering.",
+                f"Artist name: {seed}\nCurrent obsession hint: {_first_nonempty_line(obsession_raw)}",
+            )
+            name = _first_nonempty_line(name_raw) or seed
+            clean_traits = _split_list_text(traits_raw, max_items=7)
             if len(clean_traits) < 3:
                 raise HostedCallError("LLM returned insufficient personality traits.")
-            obsession = str(out.get("current_obsession", "")).strip()
+            obsession = _first_nonempty_line(obsession_raw)
             if not obsession:
                 raise HostedCallError("LLM returned empty obsession.")
             return {"name": name, "personality_traits": clean_traits, "current_obsession": obsession}
@@ -791,10 +968,10 @@ class OllamaLLMBackend(LLMBackend):
             text = self._chat_text(
                 "Return exactly one concise art vision sentence. No JSON. No bullet points.",
                 (
-                    VISION_WEIGHT_GUIDANCE
+                    SOUL_CONTEXT_GUIDANCE
                     + TIER_GUIDANCE_TEXT
                     + f"soul_packet:{packet}\npreferences:{prefs[-8:]}\nprinciples:{principles[-8:]}\ninstructions:{instructions[-8:]}\nrecent:{recent}\n"
-                    + "Prioritize novelty versus recent visions."
+                    + "Prefer meaningful variation in composition while preserving continuity with the artist's soul."
                 ),
             )
             vision = text.strip().strip('"').splitlines()[0].strip()
@@ -807,47 +984,132 @@ class OllamaLLMBackend(LLMBackend):
     def generate_run_intent(self, soul_data: Dict) -> Dict:
         try:
             packet = build_soul_packet(soul_data)
-            out = self._chat_json(
-                "Return strict JSON only: "
-                "{\"vision_directive\": string, \"critique_directive\": string, \"revision_directive\": string}.",
-                (
-                    INTENT_WEIGHT_GUIDANCE
-                    + TIER_GUIDANCE_TEXT
-                    + "vision_directive should push distinct composition/motif from recent works.\n"
-                    + "critique_directive should evaluate alignment with soul, not generic quality alone.\n"
-                    + "revision_directive should explain how identity should evolve from outcome.\n"
-                    + f"soul_packet:{packet}"
-                ),
+            context = (
+                SOUL_CONTEXT_GUIDANCE
+                + TIER_GUIDANCE_TEXT
+                + f"soul_packet:{packet}"
+            )
+            out = self._chat_text(
+                "Respond using three lines:\n"
+                "VISION_DIRECTIVE: <text>\n"
+                "CRITIQUE_DIRECTIVE: <text>\n"
+                "REVISION_DIRECTIVE: <text>",
+                context,
             )
             return {
-                "vision_directive": str(out.get("vision_directive", "")).strip(),
-                "critique_directive": str(out.get("critique_directive", "")).strip(),
-                "revision_directive": str(out.get("revision_directive", "")).strip(),
+                "vision_directive": _extract_labeled_value(out, "vision_directive"),
+                "critique_directive": _extract_labeled_value(out, "critique_directive"),
+                "revision_directive": _extract_labeled_value(out, "revision_directive"),
             }
         except Exception as exc:
             raise HostedCallError(f"Ollama run-intent generation failed: {exc}") from exc
 
+    def refine_render_prompt(
+        self,
+        current_prompt: str,
+        vision: str,
+        critique_feedback: str,
+        score: int,
+        soul_data: Dict,
+        run_intent: Optional[Dict] = None,
+    ) -> str:
+        try:
+            packet = build_soul_packet(soul_data)
+            directive = str((run_intent or {}).get("vision_directive", "")).strip()
+            out = self._chat_text(
+                "You are revising only the iteration image prompt for the next attempt.\n"
+                "The run vision is fixed and must not be rewritten.\n"
+                "Make minimal, targeted edits to CURRENT_IMAGE_PROMPT using critique feedback.\n"
+                "Return exactly one line in this format:\n"
+                "IMAGE_PROMPT: <revised prompt text>",
+                (
+                    f"fixed_run_vision:{vision}\n"
+                    f"current_image_prompt:{current_prompt}\n"
+                    f"critique_feedback:{critique_feedback}\n"
+                    f"score:{int(score)}\n"
+                    f"vision_directive:{directive}\n"
+                    f"soul_packet:{packet}\n"
+                    "Keep continuity with the fixed run vision while improving the next image attempt."
+                )
+            )
+            next_prompt = _extract_image_prompt(out, current_prompt)
+            if next_prompt == current_prompt:
+                retry = self._chat_text(
+                    "Respond with exactly one line: IMAGE_PROMPT: <text>",
+                    (
+                        f"fixed_run_vision:{vision}\n"
+                        f"current_image_prompt:{current_prompt}\n"
+                        f"critique_feedback:{critique_feedback}\n"
+                        f"score:{int(score)}\n"
+                    ),
+                )
+                next_prompt = _extract_image_prompt(retry, current_prompt)
+            return next_prompt or current_prompt
+        except Exception as exc:
+            raise HostedCallError(f"Ollama prompt refinement failed: {exc}") from exc
+
     def propose_state_revision(self, soul_data: Dict, creation_result: Dict) -> Dict:
         try:
             packet = build_soul_packet(soul_data)
-            out = self._chat_json(
-                "Return strict JSON only with keys: "
-                "{\"obsession\": string, "
-                "\"personality_mode\": \"keep|append|replace\", "
-                "\"personality_traits\": [string], "
-                "\"text_memory_action\": \"none|add|edit_last|delete_last\", "
-                "\"text_memory\": {\"content\": string, \"importance\": \"critical|high|medium|low\", \"tags\": [string]}, "
-                "\"artwork_memory_action\": \"none|annotate_last|delete_last\", "
-                "\"artwork_note\": string}.",
-                (
-                    REVISION_WEIGHT_GUIDANCE
-                    + TIER_GUIDANCE_TEXT
-                    + "If creation_result.score <= 7 or creation_result.worthy is false, identity drift is required: "
-                    + "change obsession and/or change personality traits materially (not just restating current values).\n"
-                    + f"soul_packet:{packet}\ncreation_result:{creation_result}"
-                ),
+            context = (
+                SOUL_CONTEXT_GUIDANCE
+                + TIER_GUIDANCE_TEXT
+                + f"soul_packet:{packet}\ncreation_result:{creation_result}"
             )
-            return out if isinstance(out, dict) else {}
+            revision: Dict = {}
+
+            obsession_decision = self._chat_text(
+                "Current obsession update.\nRespond with one line: KEEP or SET: <new obsession>",
+                context,
+            )
+            obsession_line = _first_nonempty_line(obsession_decision)
+            if obsession_line.lower().startswith("set:"):
+                revision["obsession"] = obsession_line.split(":", 1)[1].strip()
+
+            personality_mode_raw = self._chat_text(
+                "Choose personality mode. Respond with one token only: keep, append, or replace.",
+                context,
+            )
+            personality_mode = _normalize_choice(personality_mode_raw, ["keep", "append", "replace"], "keep")
+            revision["personality_mode"] = personality_mode
+            if personality_mode in ("append", "replace"):
+                traits_raw = self._chat_text(
+                    "List personality traits for this mode as comma-separated values.",
+                    context,
+                )
+                revision["personality_traits"] = _split_list_text(traits_raw, max_items=10)
+
+            text_action_raw = self._chat_text(
+                "Choose text memory action. Respond with one token only: none, add, edit_last, or delete_last.",
+                context,
+            )
+            text_action = _normalize_choice(text_action_raw, ["none", "add", "edit_last", "delete_last"], "none")
+            revision["text_memory_action"] = text_action
+            if text_action in ("add", "edit_last"):
+                text_mem_raw = self._chat_text(
+                    "Respond with lines:\nCONTENT: <text>\nIMPORTANCE: <critical|high|medium|low>\nTAGS: <comma separated tags>",
+                    context,
+                )
+                revision["text_memory"] = {
+                    "content": _extract_labeled_value(text_mem_raw, "content") or _first_nonempty_line(text_mem_raw),
+                    "importance": _normalize_choice(_extract_labeled_value(text_mem_raw, "importance"), ["critical", "high", "medium", "low"], "medium"),
+                    "tags": _split_list_text(_extract_labeled_value(text_mem_raw, "tags"), max_items=8),
+                }
+
+            artwork_action_raw = self._chat_text(
+                "Choose artwork memory action. Respond with one token only: none, annotate_last, or delete_last.",
+                context,
+            )
+            artwork_action = _normalize_choice(artwork_action_raw, ["none", "annotate_last", "delete_last"], "none")
+            revision["artwork_memory_action"] = artwork_action
+            if artwork_action == "annotate_last":
+                note_raw = self._chat_text(
+                    "Provide one concise artwork note line.",
+                    context,
+                )
+                revision["artwork_note"] = _first_nonempty_line(note_raw)
+
+            return revision
         except Exception as exc:
             raise HostedCallError(f"Ollama state revision failed: {exc}") from exc
 
@@ -911,27 +1173,72 @@ class HostedLLMBackend(LLMBackend):
 
         raise ValueError(f"No text from provider: {self.provider}")
 
-    def _chat_json(self, system_prompt: str, user_prompt: str, max_tokens: int = 400, image_path: Optional[str] = None) -> Dict:
-        return parse_json_object(self._chat_text(system_prompt, user_prompt, max_tokens, image_path))
-
     def critique(self, image_path: str, vision: str, iteration: int, critique_frame: str = "") -> Dict:
         try:
-            out = self._chat_json("Return strict JSON: score (1-10), feedback.", f"vision:{vision}\niteration:{iteration}\ncritique_frame:{critique_frame}", 180, image_path)
-            return {"score": max(1, min(10, int(out.get("score", 0)))), "feedback": str(out.get("feedback", "Needs refinement."))}
+            raw = self._chat_text(
+                "Evaluate this artwork and respond using exactly two lines:\n"
+                "SCORE: <integer 1-10>\n"
+                "FEEDBACK: <one concise critique sentence>",
+                f"vision:{vision}\niteration:{iteration}\ncritique_frame:{critique_frame}",
+                220,
+                image_path,
+            )
+            parsed_score = _extract_int_in_range(raw, 1, 10)
+            if parsed_score is None:
+                score_raw = self._chat_text(
+                    "Respond with one integer from 1 to 10 only.",
+                    f"vision:{vision}\niteration:{iteration}",
+                    40,
+                    image_path,
+                )
+                parsed_score = _extract_int_in_range(score_raw, 1, 10)
+            if parsed_score is None:
+                raise ValueError("Could not parse critique score.")
+            feedback = _extract_labeled_value(raw, "feedback") or _first_nonempty_line(raw)
+            if not feedback or feedback.isdigit():
+                feedback_raw = self._chat_text(
+                    "Respond with exactly one concise critique sentence only.",
+                    f"vision:{vision}\niteration:{iteration}\nscore:{parsed_score}\ncritique_frame:{critique_frame}",
+                    160,
+                    image_path,
+                )
+                feedback = _first_nonempty_line(feedback_raw)
+            if not feedback:
+                raise ValueError("Could not parse critique feedback.")
+            return {"score": parsed_score, "feedback": feedback}
         except Exception as exc:
             raise HostedCallError(f"Hosted critique failed: {exc}") from exc
 
     def judge_worthiness(self, image_path: str, score: int, vision: str, critique_frame: str = "") -> bool:
         try:
-            out = self._chat_json("Return strict JSON: worthy(boolean).", f"vision:{vision}\nscore:{score}\ncritique_frame:{critique_frame}", 120, image_path)
-            return bool(out.get("worthy", score >= 7))
+            raw = self._chat_text(
+                "Decide if this artwork is worthy. Respond with one token only: YES or NO.",
+                f"vision:{vision}\nscore:{score}\ncritique_frame:{critique_frame}",
+                60,
+                image_path,
+            )
+            worthy = _extract_yes_no(raw)
+            if worthy is None:
+                raise ValueError("Could not parse worthy decision.")
+            return worthy
         except Exception as exc:
             raise HostedCallError(f"Hosted judgment failed: {exc}") from exc
 
     def generate_text_memory(self, soul_data: Dict, creation_result: Dict, trigger_reason: str) -> Dict:
         try:
-            out = self._chat_json("Return strict JSON: content, importance, tags.", f"trigger:{trigger_reason}\nresult:{creation_result}", 220)
-            return safe_text_memory(out, soul_data)
+            raw = self._chat_text(
+                "Generate one text memory and respond using lines:\n"
+                "CONTENT: <text>\n"
+                "IMPORTANCE: <critical|high|medium|low>\n"
+                "TAGS: <comma separated tags>",
+                f"trigger:{trigger_reason}\nresult:{creation_result}",
+                240,
+            )
+            content = _extract_labeled_value(raw, "content") or _first_nonempty_line(raw)
+            importance = _normalize_choice(_extract_labeled_value(raw, "importance"), ["critical", "high", "medium", "low"], "medium")
+            tags_raw = _extract_labeled_value(raw, "tags")
+            tags = _split_list_text(tags_raw, max_items=6)
+            return safe_text_memory({"content": content, "importance": importance, "tags": tags}, soul_data)
         except Exception as exc:
             raise HostedCallError(f"Hosted memory generation failed: {exc}") from exc
 
@@ -954,19 +1261,27 @@ class HostedLLMBackend(LLMBackend):
 
     def generate_identity(self, current_name: str) -> Dict:
         try:
-            out = self._chat_json(
-                "Return strict JSON: name, personality_traits(array of 3-7), current_obsession.",
-                f"Create a distinctive artistic identity. Current name hint: {current_name}",
-                260,
+            seed = current_name.strip() if current_name.strip() else "Unnamed Artist"
+            name_raw = self._chat_text(
+                "Return exactly one artist name line only.",
+                f"Current name hint: {seed}",
+                80,
             )
-            name = str(out.get("name", "")).strip() or (current_name.strip() if current_name.strip() else "Unnamed Artist")
-            traits = out.get("personality_traits", [])
-            if not isinstance(traits, list):
-                traits = []
-            clean_traits = [str(t).strip() for t in traits if str(t).strip()][:7]
+            obsession_raw = self._chat_text(
+                "Return exactly one current obsession line only.",
+                f"Artist name: {seed}",
+                120,
+            )
+            traits_raw = self._chat_text(
+                "Return 3 to 7 personality traits, comma-separated. No numbering.",
+                f"Artist name: {seed}\nCurrent obsession hint: {_first_nonempty_line(obsession_raw)}",
+                180,
+            )
+            name = _first_nonempty_line(name_raw) or seed
+            clean_traits = _split_list_text(traits_raw, max_items=7)
             if len(clean_traits) < 3:
                 raise ValueError("insufficient traits")
-            obsession = str(out.get("current_obsession", "")).strip()
+            obsession = _first_nonempty_line(obsession_raw)
             if not obsession:
                 raise ValueError("empty obsession")
             return {"name": name, "personality_traits": clean_traits, "current_obsession": obsession}
@@ -983,10 +1298,10 @@ class HostedLLMBackend(LLMBackend):
             text = self._chat_text(
                 "Return exactly one concise art vision sentence. No JSON. No bullet points.",
                 (
-                    VISION_WEIGHT_GUIDANCE
+                    SOUL_CONTEXT_GUIDANCE
                     + TIER_GUIDANCE_TEXT
                     + f"soul_packet:{packet}\npreferences:{prefs[-8:]}\nprinciples:{principles[-8:]}\ninstructions:{instructions[-8:]}\nrecent:{recent}\n"
-                    + "Prioritize novelty against recent visions."
+                    + "Prefer meaningful variation in composition while preserving continuity with the artist's soul."
                 ),
                 90,
             )
@@ -1000,42 +1315,141 @@ class HostedLLMBackend(LLMBackend):
     def generate_run_intent(self, soul_data: Dict) -> Dict:
         try:
             packet = build_soul_packet(soul_data)
-            out = self._chat_json(
-                "Return strict JSON: vision_directive, critique_directive, revision_directive.",
+            out = self._chat_text(
+                "Respond using three lines:\n"
+                "VISION_DIRECTIVE: <text>\n"
+                "CRITIQUE_DIRECTIVE: <text>\n"
+                "REVISION_DIRECTIVE: <text>",
                 (
-                    INTENT_WEIGHT_GUIDANCE
+                    SOUL_CONTEXT_GUIDANCE
                     + TIER_GUIDANCE_TEXT
-                    + "vision_directive should push distinct composition/motif from recent works.\n"
-                    + "critique_directive should evaluate alignment with soul, not generic quality alone.\n"
-                    + "revision_directive should explain how identity should evolve from outcome.\n"
                     + f"soul_packet:{packet}"
                 ),
-                260,
+                320,
             )
             return {
-                "vision_directive": str(out.get("vision_directive", "")).strip(),
-                "critique_directive": str(out.get("critique_directive", "")).strip(),
-                "revision_directive": str(out.get("revision_directive", "")).strip(),
+                "vision_directive": _extract_labeled_value(out, "vision_directive"),
+                "critique_directive": _extract_labeled_value(out, "critique_directive"),
+                "revision_directive": _extract_labeled_value(out, "revision_directive"),
             }
         except Exception as exc:
             raise HostedCallError(f"Hosted run intent generation failed: {exc}") from exc
 
+    def refine_render_prompt(
+        self,
+        current_prompt: str,
+        vision: str,
+        critique_feedback: str,
+        score: int,
+        soul_data: Dict,
+        run_intent: Optional[Dict] = None,
+    ) -> str:
+        try:
+            packet = build_soul_packet(soul_data)
+            directive = str((run_intent or {}).get("vision_directive", "")).strip()
+            out = self._chat_text(
+                "You are revising only the iteration image prompt for the next attempt.\n"
+                "The run vision is fixed and must not be rewritten.\n"
+                "Make minimal, targeted edits to CURRENT_IMAGE_PROMPT using critique feedback.\n"
+                "Return exactly one line in this format:\n"
+                "IMAGE_PROMPT: <revised prompt text>",
+                (
+                    f"fixed_run_vision:{vision}\n"
+                    f"current_image_prompt:{current_prompt}\n"
+                    f"critique_feedback:{critique_feedback}\n"
+                    f"score:{int(score)}\n"
+                    f"vision_directive:{directive}\n"
+                    f"soul_packet:{packet}\n"
+                    "Keep continuity with the fixed run vision while improving the next image attempt."
+                ),
+                300,
+            )
+            next_prompt = _extract_image_prompt(out, current_prompt)
+            if next_prompt == current_prompt:
+                retry = self._chat_text(
+                    "Respond with exactly one line: IMAGE_PROMPT: <text>",
+                    (
+                        f"fixed_run_vision:{vision}\n"
+                        f"current_image_prompt:{current_prompt}\n"
+                        f"critique_feedback:{critique_feedback}\n"
+                        f"score:{int(score)}\n"
+                    ),
+                    120,
+                )
+                next_prompt = _extract_image_prompt(retry, current_prompt)
+            return next_prompt or current_prompt
+        except Exception as exc:
+            raise HostedCallError(f"Hosted prompt refinement failed: {exc}") from exc
+
     def propose_state_revision(self, soul_data: Dict, creation_result: Dict) -> Dict:
         try:
             packet = build_soul_packet(soul_data)
-            out = self._chat_json(
-                "Return strict JSON with keys: obsession, personality_mode(keep|append|replace), personality_traits(array), "
-                "text_memory_action(none|add|edit_last|delete_last), text_memory(object), artwork_memory_action(none|annotate_last|delete_last), artwork_note.",
-                (
-                    REVISION_WEIGHT_GUIDANCE
-                    + TIER_GUIDANCE_TEXT
-                    + "If creation_result.score <= 7 or creation_result.worthy is false, identity drift is required: "
-                    + "change obsession and/or change personality traits materially (not just restating current values).\n"
-                    + f"soul_packet:{packet}\ncreation_result:{creation_result}"
-                ),
-                420,
+            context = (
+                SOUL_CONTEXT_GUIDANCE
+                + TIER_GUIDANCE_TEXT
+                + f"soul_packet:{packet}\ncreation_result:{creation_result}"
             )
-            return out if isinstance(out, dict) else {}
+            revision: Dict = {}
+
+            obsession_decision = self._chat_text(
+                "Current obsession update.\nRespond with one line: KEEP or SET: <new obsession>",
+                context,
+                140,
+            )
+            obsession_line = _first_nonempty_line(obsession_decision)
+            if obsession_line.lower().startswith("set:"):
+                revision["obsession"] = obsession_line.split(":", 1)[1].strip()
+
+            personality_mode_raw = self._chat_text(
+                "Choose personality mode. Respond with one token only: keep, append, or replace.",
+                context,
+                60,
+            )
+            personality_mode = _normalize_choice(personality_mode_raw, ["keep", "append", "replace"], "keep")
+            revision["personality_mode"] = personality_mode
+            if personality_mode in ("append", "replace"):
+                traits_raw = self._chat_text(
+                    "List personality traits for this mode as comma-separated values.",
+                    context,
+                    220,
+                )
+                revision["personality_traits"] = _split_list_text(traits_raw, max_items=10)
+
+            text_action_raw = self._chat_text(
+                "Choose text memory action. Respond with one token only: none, add, edit_last, or delete_last.",
+                context,
+                80,
+            )
+            text_action = _normalize_choice(text_action_raw, ["none", "add", "edit_last", "delete_last"], "none")
+            revision["text_memory_action"] = text_action
+            if text_action in ("add", "edit_last"):
+                text_mem_raw = self._chat_text(
+                    "Respond with lines:\nCONTENT: <text>\nIMPORTANCE: <critical|high|medium|low>\nTAGS: <comma separated tags>",
+                    context,
+                    260,
+                )
+                revision["text_memory"] = {
+                    "content": _extract_labeled_value(text_mem_raw, "content") or _first_nonempty_line(text_mem_raw),
+                    "importance": _normalize_choice(_extract_labeled_value(text_mem_raw, "importance"), ["critical", "high", "medium", "low"], "medium"),
+                    "tags": _split_list_text(_extract_labeled_value(text_mem_raw, "tags"), max_items=8),
+                }
+
+            artwork_action_raw = self._chat_text(
+                "Choose artwork memory action. Respond with one token only: none, annotate_last, or delete_last.",
+                context,
+                80,
+            )
+            artwork_action = _normalize_choice(artwork_action_raw, ["none", "annotate_last", "delete_last"], "none")
+            revision["artwork_memory_action"] = artwork_action
+            if artwork_action == "annotate_last":
+                note_raw = self._chat_text(
+                    "Provide one concise artwork note line.",
+                    context,
+                    180,
+                )
+                revision["artwork_note"] = _first_nonempty_line(note_raw)
+
+            return revision
         except Exception as exc:
             raise HostedCallError(f"Hosted state revision failed: {exc}") from exc
 
@@ -1068,14 +1482,14 @@ class OllamaVisionBackend(VisionBackend):
         prompt = (
             "Generate one concise art vision sentence. "
             "Do not output JSON. Keep it under 18 words.\n\n"
-            "Weighting guidance: obsession 35%, personality 30%, text memories 20%, artwork/history 15%.\n"
+            + SOUL_CONTEXT_GUIDANCE
             + TIER_GUIDANCE_TEXT
             + f"soul_packet:{packet}\n"
             + f"preferences:{preferences[-8:]}\n"
             + f"principles:{principles[-8:]}\n"
             + f"instructions:{instructions[-8:]}\n"
             + f"recent:{recent_visions}\n"
-            + "Avoid repeating subject/composition from recent visions."
+            + "Prefer subtle variation while preserving continuity with the artist's soul."
         )
         try:
             _trace_prompt(self.trace_prompts, "vision.generate", self.provider, self.model, "Generate one concise art vision sentence.", prompt)
@@ -1131,10 +1545,10 @@ class HostedVisionBackend(VisionBackend):
         try:
             candidate = self._chat_text(
                 "Generate one concise art vision sentence.",
-                "Weighting guidance: obsession 35%, personality 30%, text memories 20%, artwork/history 15%.\n"
+                SOUL_CONTEXT_GUIDANCE
                 + TIER_GUIDANCE_TEXT
                 + f"soul_packet:{packet}\npreferences:{preferences[-8:]}\nprinciples:{principles[-8:]}\ninstructions:{instructions[-8:]}\nrecent:{recent_visions}\n"
-                + "Avoid repeating subject/composition from recent visions.",
+                + "Prefer subtle variation while preserving continuity with the artist's soul.",
                 90,
             ).strip().strip('"').replace("\n", " ")
             _, _, _, prioritized = infer_guidance(text_memories)

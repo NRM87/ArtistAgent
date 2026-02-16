@@ -72,7 +72,7 @@ def test_ascii_backend_preserves_unicode_text_art(tmp_path: Path):
     assert "│█░│" in text
 
 
-def test_ascii_backend_rejects_readable_note_text(tmp_path: Path):
+def test_ascii_backend_allows_readable_note_text_with_warning(tmp_path: Path):
     class ChattyLLM:
         def generate_ascii_art(self, prompt: str, iteration: int, creation_id: int, width: int = 0, height: int = 0) -> str:
             return (
@@ -84,11 +84,10 @@ def test_ascii_backend_rejects_readable_note_text(tmp_path: Path):
             )
 
     backend = AsciiImageBackend(tmp_path, llm_backend=ChattyLLM(), ascii_size="60x20")
-    try:
-        backend.generate("chatty", 0, 4)
-        assert False, "Expected HostedCallError for readable text in ASCII output."
-    except HostedCallError:
-        pass
+    out = Path(backend.generate("chatty", 0, 4))
+    text = out.read_text(encoding="utf-8")
+    assert "renderer: llm" in text
+    assert "quality_warnings: readable_text" in text
 
 
 def test_ascii_backend_retries_and_accepts_non_text_variant(tmp_path: Path):
@@ -108,6 +107,19 @@ def test_ascii_backend_retries_and_accepts_non_text_variant(tmp_path: Path):
     text = out.read_text(encoding="utf-8")
     assert "renderer: llm" in text
     assert llm.calls >= 2
+    assert "quality_warnings: none" in text
+
+
+def test_ascii_backend_allows_sparse_output_with_warning(tmp_path: Path):
+    class SparseLLM:
+        def generate_ascii_art(self, prompt: str, iteration: int, creation_id: int, width: int = 0, height: int = 0) -> str:
+            return "."
+
+    backend = AsciiImageBackend(tmp_path, llm_backend=SparseLLM(), ascii_size="60x20")
+    out = Path(backend.generate("sparse", 0, 7))
+    text = out.read_text(encoding="utf-8")
+    assert "quality_warnings:" in text
+    assert "sparse_output" in text
 
 
 def test_ascii_backend_without_llm_backend_fails_closed(tmp_path: Path):

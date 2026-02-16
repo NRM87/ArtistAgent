@@ -99,6 +99,90 @@ def infer_guidance(text_memories: List[Dict]) -> Tuple[List[str], List[str], Lis
     return preferences, principles, instructions, prioritized_subjects
 
 
+def extract_hard_constraints(text_memories: List[Dict], limit: int = 6) -> List[str]:
+    constraints: List[str] = []
+    seen = set()
+    for mem in reversed(text_memories):
+        content = str(mem.get("content", "")).strip()
+        if not content:
+            continue
+        tags = [str(t).lower().strip() for t in (mem.get("tags", []) or []) if str(t).strip()]
+        importance = str(mem.get("importance", "medium")).lower().strip()
+        lc = content.lower()
+        is_restrictive = bool(
+            re.search(r"\b(only|never|must|always|do not|don't|should not|cannot|can't)\b", lc)
+        )
+        if importance != "critical" and not is_restrictive:
+            continue
+        if not (is_restrictive or any(t in tags for t in ("constraint", "judgment", "principle", "rule"))):
+            continue
+        norm = re.sub(r"\s+", " ", content).strip()
+        key = norm.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        constraints.append(norm)
+        if len(constraints) >= limit:
+            break
+    constraints.reverse()
+    return constraints
+
+
+def directive_conflicts_hard_constraints(directive: str, hard_constraints: List[str]) -> bool:
+    d = str(directive).strip().lower()
+    if not d or not hard_constraints:
+        return False
+    joined = " ".join(hard_constraints).lower()
+    restrictive = bool(re.search(r"\b(only|never|must|always|do not|don't|should not|cannot|can't)\b", joined))
+    if not restrictive:
+        return False
+    if re.search(r"\b(challenge|break|subvert|ignore|abandon|deviate|reject|violate|contradict|discard)\b", d):
+        return True
+    if re.search(
+        r"\b(wider variety|wider range|broader range|broader|diverse|more shapes|other geometric|broaden|expand scope|expanding scope|integrat)\b",
+        d,
+    ):
+        return True
+    if "non-square" in d and "square" in joined:
+        return True
+    if "square" in joined and re.search(r"\b(triangle|circle|organic curve|curves)\b", d):
+        return True
+    return False
+
+
+def sanitize_vision_against_constraints(vision: str, hard_constraints: List[str]) -> str:
+    v = str(vision).strip()
+    if not v:
+        return v
+    constraints = [str(c).strip().lower() for c in hard_constraints if str(c).strip()]
+    joined = " ".join(constraints)
+    restrictive = bool(re.search(r"\b(only|never|must|always|do not|don't|should not|cannot|can't)\b", joined))
+    if not restrictive or "square" not in joined:
+        return v
+
+    out = v
+    out = re.sub(
+        r"\b(despite|while|although|but|however)\b[^.]*\b(broader|wider|diverse|variety|other geometric|non-square|integrat)\b[^.]*\.?",
+        "",
+        out,
+        flags=re.I,
+    )
+    out = re.sub(
+        r"\b(broader range of geometric shapes|wider range of geometric shapes|wider variety of geometric shapes|broader geometric forms)\b",
+        "subtle variation in square and near-square arrangements",
+        out,
+        flags=re.I,
+    )
+    if re.search(r"\b(wider|broader|diverse|variety|other geometric|integrat)\b", out, flags=re.I):
+        out = re.sub(r"[,:;]\s*\b(wider|broader|diverse|variety|other geometric|integrat)\b.*", "", out, flags=re.I)
+    out = re.sub(r"\s+", " ", out).strip(" ,.;")
+    if "square" not in out.lower():
+        out = f"{out}. Focus on square and near-square forms."
+    if not out.endswith("."):
+        out += "."
+    return out
+
+
 def memory_collision(new_parsed: ParsedVision, last_memories: List[Dict], prioritized_subjects: set) -> bool:
     new_tokens = set(re.findall(r"[a-zA-Z']+", new_parsed.relation.lower()))
     for m in last_memories:
@@ -113,20 +197,49 @@ def memory_collision(new_parsed: ParsedVision, last_memories: List[Dict], priori
     return False
 
 
-def vision_to_prompt(vision: str, soul: Optional[Dict] = None) -> str:
-    parsed = parse_vision(vision)
-    composition = "asymmetric composition" if "off-center" in parsed.relation or "diagonal" in parsed.relation else "balanced composition"
-
-    style = "expressive composition"
+def vision_to_prompt(
+    vision: str,
+    soul: Optional[Dict] = None,
+    vision_directive: str = "",
+    hard_constraints: Optional[List[str]] = None,
+) -> str:
+    v = str(vision).strip() or "Create a distinctive visual composition."
+    traits: List[str] = []
+    obsession = ""
+    anchors: List[str] = []
     if soul is not None:
-        text_memories = soul.get("text_memories", []) or []
-        style_mem = next((m for m in reversed(text_memories) if "style" in (m.get("tags", []) or [])), None)
-        if style_mem and style_mem.get("content"):
-            style = str(style_mem["content"])
-        elif any("melancholic" in str(t).lower() for t in soul.get("personality_traits", [])):
-            style = "moody cinematic atmosphere"
+        traits = [str(t).strip() for t in (soul.get("personality_traits", []) or []) if str(t).strip()][:6]
+        obsession = str(soul.get("current_obsession", "")).strip()
+        text_memories = list(soul.get("text_memories", []) or [])
+        for mem in reversed(text_memories):
+            content = str(mem.get("content", "")).strip()
+            if not content:
+                continue
+            tags = [str(t).lower().strip() for t in (mem.get("tags", []) or []) if str(t).strip()]
+            if any(t in tags for t in ("principle", "preference", "learning", "judgment")):
+                anchors.append(content)
+            if len(anchors) >= 3:
+                break
 
-    return f"{style}: {parsed.color} {parsed.subject}, {parsed.relation}, {composition}"
+    lines: List[str] = [f'Create a coherent 2D composition from this vision: "{v}"']
+    if traits:
+        lines.append(f"Artist traits: {', '.join(traits)}.")
+    if obsession:
+        lines.append(f"Current obsession: {obsession}.")
+    if anchors:
+        lines.append("Memory anchors:")
+        for a in reversed(anchors):
+            lines.append(f"- {a}")
+    hc = [str(x).strip() for x in (hard_constraints or []) if str(x).strip()]
+    if hc:
+        lines.append("Non-negotiable constraints (override exploratory directives):")
+        for rule in hc:
+            lines.append(f"- {rule}")
+    vd = str(vision_directive).strip()
+    if vd:
+        lines.append(f"Exploration directive (must respect constraints): {vd}")
+    lines.append("Prioritize clear composition and visual intent over decorative noise.")
+    return "\n".join(lines)
 
 
 def next_text_memory_id(soul: Dict) -> int:
@@ -169,9 +282,19 @@ def safe_text_memory(memory: Dict, soul_data: Dict) -> Dict:
 
 
 def consolidate_text_memories(text_memories: List[Dict]) -> List[Dict]:
+    # Drop duplicate memory statements (latest wins) before tier caps.
+    # This reduces drift where repeated revision edits clone the same note.
+    latest_by_content = {}
+    for m in sorted(text_memories, key=lambda x: x.get("timestamp", "")):
+        key = re.sub(r"\s+", " ", str(m.get("content", "")).strip().lower())
+        if not key:
+            continue
+        latest_by_content[key] = m
+    deduped = list(latest_by_content.values())
+
     by_tier = {k: [] for k in TEXT_TIER_CAPS}
     other = []
-    for m in sorted(text_memories, key=lambda x: x.get("timestamp", "")):
+    for m in sorted(deduped, key=lambda x: x.get("timestamp", "")):
         tier = m.get("importance", "low")
         (by_tier[tier] if tier in by_tier else other).append(m)
 

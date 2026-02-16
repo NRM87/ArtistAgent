@@ -1,4 +1,11 @@
-﻿from artist_agent.memory import consolidate_text_memories, trim_artwork_memories
+from artist_agent.memory import (
+    consolidate_text_memories,
+    directive_conflicts_hard_constraints,
+    extract_hard_constraints,
+    sanitize_vision_against_constraints,
+    trim_artwork_memories,
+    vision_to_prompt,
+)
 
 
 def _text_mem(i: int, importance: str):
@@ -93,3 +100,95 @@ def test_artwork_trim_retains_some_failure_references():
     assert len(failures) >= 2
     assert len(studies) >= 4
     assert len(masterpieces) >= 8
+
+
+def test_extract_hard_constraints_from_critical_memories():
+    text_memories = [
+        {"content": "Preference: try softer shading.", "importance": "medium", "tags": ["preference"]},
+        {
+            "content": "Judgment rule: non-square motifs should receive low scores and never be marked worthy.",
+            "importance": "critical",
+            "tags": ["judgment", "constraint"],
+        },
+        {
+            "content": "Principle: only square or near-square forms express true compositional integrity.",
+            "importance": "critical",
+            "tags": ["principle"],
+        },
+    ]
+    constraints = extract_hard_constraints(text_memories)
+    joined = " ".join(constraints).lower()
+    assert "non-square motifs" in joined
+    assert "only square" in joined
+
+
+def test_directive_conflict_detected_for_restrictive_constraints():
+    constraints = [
+        "Principle: only square or near-square forms express true compositional integrity.",
+        "Judgment rule: non-square motifs should receive low scores and never be marked worthy.",
+    ]
+    directive = "Explore unconventional geometric compositions that challenge strict adherence to these shapes."
+    assert directive_conflicts_hard_constraints(directive, constraints) is True
+
+
+def test_directive_conflict_detected_for_broader_shape_language():
+    constraints = [
+        "Principle: only square or near-square forms express true compositional integrity.",
+    ]
+    directive = "Push compositions toward a wider variety of geometric shapes."
+    assert directive_conflicts_hard_constraints(directive, constraints) is True
+
+
+def test_sanitize_vision_against_square_constraint_removes_broader_clause():
+    constraints = ["Principle: only square or near-square forms express true compositional integrity."]
+    vision = (
+        "Square studies dominate the work, while integrating a broader range of geometric shapes "
+        "to avoid rigidity."
+    )
+    out = sanitize_vision_against_constraints(vision, constraints)
+    assert "broader range of geometric shapes" not in out.lower()
+    assert "square" in out.lower()
+
+
+def test_vision_prompt_is_natural_language_with_constraints():
+    soul = {
+        "personality_traits": ["Orthogonal", "Strict"],
+        "current_obsession": "Perfect squares and right angles",
+        "text_memories": [
+            {"content": "Principle: only square forms matter.", "tags": ["principle"], "importance": "critical"}
+        ],
+    }
+    prompt = vision_to_prompt(
+        "Emphasize perfect squares in a calm field.",
+        soul=soul,
+        vision_directive="Create layering and depth.",
+        hard_constraints=["Only square motifs are allowed."],
+    )
+    assert "Create a coherent 2D composition" in prompt
+    assert "Non-negotiable constraints" in prompt
+    assert "Only square motifs are allowed." in prompt
+    assert "unspecified" not in prompt.lower()
+
+
+def test_consolidate_text_memories_deduplicates_same_content():
+    text_memories = [
+        {
+            "type": "text",
+            "id": 1,
+            "content": "Principle: only square forms matter.",
+            "importance": "critical",
+            "timestamp": "2026-02-15T14:00:00",
+            "tags": ["principle"],
+        },
+        {
+            "type": "text",
+            "id": 2,
+            "content": " Principle: only   square forms matter. ",
+            "importance": "critical",
+            "timestamp": "2026-02-15T14:01:00",
+            "tags": ["principle"],
+        },
+    ]
+    consolidated = consolidate_text_memories(text_memories)
+    assert len(consolidated) == 1
+    assert consolidated[0]["id"] == 2

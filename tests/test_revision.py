@@ -63,3 +63,40 @@ def test_proposes_identity_change_detects_obsession_or_trait_shift():
     assert proposes_identity_change({"personality_mode": "append", "personality_traits": ["C"]}, soul) is True
     assert proposes_identity_change({"personality_mode": "replace", "personality_traits": ["A", "B"]}, soul) is False
     assert proposes_identity_change({"personality_mode": "keep"}, soul) is False
+
+
+def test_apply_state_revision_preserves_judgment_constraint_role(tmp_path: Path):
+    soul = {
+        "current_obsession": "Squares",
+        "personality_traits": ["Orthogonal"],
+        "text_memories": [
+            {
+                "type": "text",
+                "id": 1,
+                "content": "Principle: only square or near-square forms express true compositional integrity.",
+                "importance": "critical",
+                "timestamp": "2026-02-15T14:00:00",
+                "tags": ["principle", "square", "composition"],
+            },
+            {
+                "type": "text",
+                "id": 2,
+                "content": "Judgment rule: non-square motifs should receive low scores and never be marked worthy.",
+                "importance": "critical",
+                "timestamp": "2026-02-15T14:01:00",
+                "tags": ["judgment", "square", "constraint"],
+            },
+        ],
+        "memories": [],
+    }
+    revision = {
+        "text_memory_action": "edit_last",
+        "text_memory": {
+            "content": "Principle: only square or near-square forms express true compositional integrity.",
+            "importance": "critical",
+            "tags": ["principle", "square", "composition"],
+        },
+    }
+    apply_state_revision(soul, revision, tmp_path)
+    tags = [set(m.get("tags", []) or []) for m in soul.get("text_memories", [])]
+    assert any(("judgment" in t) or ("constraint" in t) for t in tags)

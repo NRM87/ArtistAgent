@@ -81,6 +81,48 @@ def _clean_traits(raw_traits: object) -> List[str]:
     return out
 
 
+def _normalized_content(value: str) -> str:
+    return " ".join(str(value).strip().lower().split())
+
+
+def _memory_tags(memory: Dict) -> set:
+    return {str(t).lower().strip() for t in list(memory.get("tags", []) or []) if str(t).strip()}
+
+
+def _has_role(memory: Dict, role: str) -> bool:
+    tags = _memory_tags(memory)
+    if role == "judgment":
+        return bool(tags & {"judgment", "constraint", "rule"})
+    if role == "principle":
+        return bool(tags & {"principle", "learning"})
+    return False
+
+
+def _preserve_constraint_roles(soul: Dict, previous_text_memories: List[Dict]) -> None:
+    current = list(soul.get("text_memories", []) or [])
+    if not previous_text_memories:
+        return
+
+    existing_norm = {_normalized_content(m.get("content", "")) for m in current if str(m.get("content", "")).strip()}
+    for role in ("principle", "judgment"):
+        had_role = any(_has_role(m, role) for m in previous_text_memories)
+        has_role = any(_has_role(m, role) for m in current)
+        if not had_role or has_role:
+            continue
+
+        candidate = next((m for m in reversed(previous_text_memories) if _has_role(m, role)), None)
+        if not candidate:
+            continue
+        norm = _normalized_content(candidate.get("content", ""))
+        if not norm or norm in existing_norm:
+            continue
+        restored = safe_text_memory(candidate, soul)
+        current.append(restored)
+        existing_norm.add(norm)
+
+    soul["text_memories"] = consolidate_text_memories(current)
+
+
 def _safe_delete_artwork_file(artwork: Dict, artist_dir: Path) -> bool:
     file_path = str(artwork.get("file_path", "")).strip()
     if not file_path:
@@ -111,6 +153,7 @@ def apply_state_revision(soul: Dict, revision: Dict, artist_dir: Path) -> Tuple[
 
     old_obsession = str(soul.get("current_obsession", "")).strip()
     old_traits = [str(t).strip() for t in list(soul.get("personality_traits", []) or []) if str(t).strip()]
+    old_text_memories = list(soul.get("text_memories", []) or [])
 
     obsession = str(revision.get("obsession", "")).strip()
     if obsession:
@@ -141,6 +184,7 @@ def apply_state_revision(soul: Dict, revision: Dict, artist_dir: Path) -> Tuple[
             else:
                 soul.setdefault("text_memories", []).append(safe)
             soul["text_memories"] = consolidate_text_memories(soul.get("text_memories", []))
+    _preserve_constraint_roles(soul, old_text_memories)
 
     deleted_file = False
     artwork_action = str(revision.get("artwork_memory_action", "none")).strip().lower()
