@@ -363,6 +363,27 @@ def _history_summary(history: List[Dict], limit: int = 12) -> Dict:
     return {"avg_score": avg, "worthy_count": worthy, "recent_visions": recent_visions}
 
 
+def _normalize_reflection_weights(raw: object) -> Dict[str, float]:
+    out = {"vision": 1.0, "refinement": 1.0, "critique": 1.0, "revision": 1.0}
+    if isinstance(raw, dict):
+        for stage in out.keys():
+            if stage not in raw:
+                continue
+            try:
+                out[stage] = float(raw.get(stage, out[stage]))
+            except (TypeError, ValueError):
+                pass
+    for stage in out.keys():
+        out[stage] = max(0.3, min(2.5, float(out[stage])))
+    return out
+
+
+def _stage_weight_guidance(packet: Dict, stage: str) -> str:
+    weights = _normalize_reflection_weights(packet.get("reflection_weights", {}))
+    w = weights.get(stage, 1.0)
+    return f"reflection_weights:{weights} | stage:{stage} | stage_weight:{w:.2f}"
+
+
 def build_soul_packet(soul: Dict) -> Dict:
     text_memories = list(soul.get("text_memories", []) or [])
     memories = list(soul.get("memories", []) or [])
@@ -377,6 +398,7 @@ def build_soul_packet(soul: Dict) -> Dict:
         "name": str(soul.get("name", "")).strip(),
         "personality_traits": [str(t).strip() for t in list(soul.get("personality_traits", []) or [])[:10] if str(t).strip()],
         "current_obsession": str(soul.get("current_obsession", "")).strip(),
+        "reflection_weights": _normalize_reflection_weights(soul.get("reflection_weights", {})),
         "text_memories": _summarize_text_memories(text_memories, 14),
         "artwork_memories": _summarize_artwork_memories(memories, 10),
         "artwork_tier_counts": tier_counts,
@@ -916,6 +938,9 @@ class LLMBackend:
     def propose_state_revision(self, soul_data: Dict, creation_result: Dict) -> Dict:
         raise NotImplementedError
 
+    def evaluate_review_merit(self, soul_data: Dict, review_payload: Dict) -> Dict:
+        raise NotImplementedError
+
 
 class MockLLM:
     @staticmethod
@@ -999,6 +1024,24 @@ class MockLLMBackend(LLMBackend):
 
     def propose_state_revision(self, soul_data: Dict, creation_result: Dict) -> Dict:
         raise HostedCallError("State revision requires an LLM backend, but current backend is mock.")
+
+    def evaluate_review_merit(self, soul_data: Dict, review_payload: Dict) -> Dict:
+        score = int(review_payload.get("score", 0))
+        decision = "accept" if score >= 8 else ("partial" if score >= 5 else "reject")
+        memory = ""
+        if decision in ("accept", "partial"):
+            memory = str(review_payload.get("suggestion", "")).strip() or str(review_payload.get("feedback", "")).strip()
+        return {
+            "decision": decision,
+            "rationale": "I accept this review because it gives concrete direction." if decision == "accept" else (
+                "I will partially use this review because it has mixed value." if decision == "partial" else
+                "I reject this review because it is not aligned with my intent."
+            ),
+            "memory_content": memory,
+            "importance": "high" if decision == "accept" else ("medium" if decision == "partial" else "low"),
+            "tags": ["review", "external_feedback", decision],
+            "obsession_update": "",
+        }
 
 
 class OllamaLLMBackend(LLMBackend):
@@ -1175,6 +1218,7 @@ class OllamaLLMBackend(LLMBackend):
                     SOUL_CONTEXT_GUIDANCE
                     + FIRST_PERSON_HINT
                     + TIER_GUIDANCE_TEXT
+                    + f"{_stage_weight_guidance(packet, 'vision')}\n"
                     + f"soul_packet:{packet}\npreferences:{prefs[-8:]}\nprinciples:{principles[-8:]}\ninstructions:{instructions[-8:]}\nrecent:{recent}\n"
                     + "Prefer meaningful variation in composition while preserving continuity with the artist's soul."
                 ),
@@ -1193,6 +1237,7 @@ class OllamaLLMBackend(LLMBackend):
                 FIRST_PERSON_HINT
                 + SOUL_CONTEXT_GUIDANCE
                 + TIER_GUIDANCE_TEXT
+                + f"{_stage_weight_guidance(packet, 'vision')}\n"
                 + f"soul_packet:{packet}"
             )
             out = self._chat_text(
@@ -1234,6 +1279,7 @@ class OllamaLLMBackend(LLMBackend):
                     f"current_image_prompt:{current_prompt}\n"
                     f"critique_feedback:{critique_feedback}\n"
                     f"score:{int(score)}\n"
+                    f"{_stage_weight_guidance(packet, 'refinement')}\n"
                     f"vision_directive:{directive}\n"
                     f"soul_packet:{packet}\n"
                     "Keep continuity with the fixed run vision while improving the next image attempt."
@@ -1262,6 +1308,7 @@ class OllamaLLMBackend(LLMBackend):
                 SOUL_CONTEXT_GUIDANCE
                 + TIER_GUIDANCE_TEXT
                 + REVISION_ACTION_HINT
+                + f"{_stage_weight_guidance(packet, 'revision')}\n"
                 + f"soul_packet:{packet}\ncreation_result:{creation_result}"
             )
             revision: Dict = {}
@@ -1320,6 +1367,45 @@ class OllamaLLMBackend(LLMBackend):
             return revision
         except Exception as exc:
             raise HostedCallError(f"Ollama state revision failed: {exc}") from exc
+
+    def evaluate_review_merit(self, soul_data: Dict, review_payload: Dict) -> Dict:
+        try:
+            packet = build_soul_packet(soul_data)
+            context = (
+                FIRST_PERSON_HINT
+                + SOUL_CONTEXT_GUIDANCE
+                + f"{_stage_weight_guidance(packet, 'revision')}\n"
+                + f"soul_packet:{packet}\nreview_payload:{review_payload}"
+            )
+            raw = self._chat_text(
+                "Evaluate this external review and respond using lines:\n"
+                "DECISION: <accept|partial|reject>\n"
+                "RATIONALE: <one first-person sentence>\n"
+                "MEMORY_CONTENT: <one actionable first-person note or blank>\n"
+                "IMPORTANCE: <critical|high|medium|low>\n"
+                "TAGS: <comma separated tags>\n"
+                "OBSESSION_UPDATE: <blank or new obsession text>",
+                context,
+            )
+            decision = _normalize_choice(_extract_labeled_value(raw, "decision"), ["accept", "partial", "reject"], "reject")
+            rationale = _extract_labeled_value(raw, "rationale") or _first_nonempty_line(raw)
+            if rationale and not _contains_first_person(rationale):
+                rewrite = self._chat_text("Rewrite rationale in first person. One sentence only.", f"rationale:{rationale}")
+                rationale = _first_nonempty_line(rewrite) or rationale
+            memory_content = _extract_labeled_value(raw, "memory_content")
+            importance = _normalize_choice(_extract_labeled_value(raw, "importance"), ["critical", "high", "medium", "low"], "medium")
+            tags = _split_list_text(_extract_labeled_value(raw, "tags"), max_items=8)
+            obsession_update = _extract_labeled_value(raw, "obsession_update")
+            return {
+                "decision": decision,
+                "rationale": rationale,
+                "memory_content": memory_content,
+                "importance": importance,
+                "tags": tags,
+                "obsession_update": obsession_update,
+            }
+        except Exception as exc:
+            raise HostedCallError(f"Ollama review-merit evaluation failed: {exc}") from exc
 
 
 class HostedLLMBackend(LLMBackend):
@@ -1534,6 +1620,7 @@ class HostedLLMBackend(LLMBackend):
                     SOUL_CONTEXT_GUIDANCE
                     + FIRST_PERSON_HINT
                     + TIER_GUIDANCE_TEXT
+                    + f"{_stage_weight_guidance(packet, 'vision')}\n"
                     + f"soul_packet:{packet}\npreferences:{prefs[-8:]}\nprinciples:{principles[-8:]}\ninstructions:{instructions[-8:]}\nrecent:{recent}\n"
                     + "Prefer meaningful variation in composition while preserving continuity with the artist's soul."
                 ),
@@ -1559,6 +1646,7 @@ class HostedLLMBackend(LLMBackend):
                     FIRST_PERSON_HINT
                     + SOUL_CONTEXT_GUIDANCE
                     + TIER_GUIDANCE_TEXT
+                    + f"{_stage_weight_guidance(packet, 'vision')}\n"
                     + f"soul_packet:{packet}"
                 ),
                 320,
@@ -1594,6 +1682,7 @@ class HostedLLMBackend(LLMBackend):
                     f"current_image_prompt:{current_prompt}\n"
                     f"critique_feedback:{critique_feedback}\n"
                     f"score:{int(score)}\n"
+                    f"{_stage_weight_guidance(packet, 'refinement')}\n"
                     f"vision_directive:{directive}\n"
                     f"soul_packet:{packet}\n"
                     "Keep continuity with the fixed run vision while improving the next image attempt."
@@ -1624,6 +1713,7 @@ class HostedLLMBackend(LLMBackend):
                 SOUL_CONTEXT_GUIDANCE
                 + TIER_GUIDANCE_TEXT
                 + REVISION_ACTION_HINT
+                + f"{_stage_weight_guidance(packet, 'revision')}\n"
                 + f"soul_packet:{packet}\ncreation_result:{creation_result}"
             )
             revision: Dict = {}
@@ -1690,6 +1780,45 @@ class HostedLLMBackend(LLMBackend):
         except Exception as exc:
             raise HostedCallError(f"Hosted state revision failed: {exc}") from exc
 
+    def evaluate_review_merit(self, soul_data: Dict, review_payload: Dict) -> Dict:
+        try:
+            packet = build_soul_packet(soul_data)
+            raw = self._chat_text(
+                "Evaluate this external review and respond using lines:\n"
+                "DECISION: <accept|partial|reject>\n"
+                "RATIONALE: <one first-person sentence>\n"
+                "MEMORY_CONTENT: <one actionable first-person note or blank>\n"
+                "IMPORTANCE: <critical|high|medium|low>\n"
+                "TAGS: <comma separated tags>\n"
+                "OBSESSION_UPDATE: <blank or new obsession text>",
+                (
+                    FIRST_PERSON_HINT
+                    + SOUL_CONTEXT_GUIDANCE
+                    + f"{_stage_weight_guidance(packet, 'revision')}\n"
+                    + f"soul_packet:{packet}\nreview_payload:{review_payload}"
+                ),
+                260,
+            )
+            decision = _normalize_choice(_extract_labeled_value(raw, "decision"), ["accept", "partial", "reject"], "reject")
+            rationale = _extract_labeled_value(raw, "rationale") or _first_nonempty_line(raw)
+            if rationale and not _contains_first_person(rationale):
+                rewrite = self._chat_text("Rewrite rationale in first person. One sentence only.", f"rationale:{rationale}", 120)
+                rationale = _first_nonempty_line(rewrite) or rationale
+            memory_content = _extract_labeled_value(raw, "memory_content")
+            importance = _normalize_choice(_extract_labeled_value(raw, "importance"), ["critical", "high", "medium", "low"], "medium")
+            tags = _split_list_text(_extract_labeled_value(raw, "tags"), max_items=8)
+            obsession_update = _extract_labeled_value(raw, "obsession_update")
+            return {
+                "decision": decision,
+                "rationale": rationale,
+                "memory_content": memory_content,
+                "importance": importance,
+                "tags": tags,
+                "obsession_update": obsession_update,
+            }
+        except Exception as exc:
+            raise HostedCallError(f"Hosted review-merit evaluation failed: {exc}") from exc
+
 
 class VisionBackend:
     def generate_vision(self, soul: Dict, ignored_ids: set) -> str:
@@ -1722,6 +1851,7 @@ class OllamaVisionBackend(VisionBackend):
             + SOUL_CONTEXT_GUIDANCE
             + FIRST_PERSON_HINT
             + TIER_GUIDANCE_TEXT
+            + f"{_stage_weight_guidance(packet, 'vision')}\n"
             + f"soul_packet:{packet}\n"
             + f"preferences:{preferences[-8:]}\n"
             + f"principles:{principles[-8:]}\n"
@@ -1787,6 +1917,7 @@ class HostedVisionBackend(VisionBackend):
                 FIRST_PERSON_HINT
                 + SOUL_CONTEXT_GUIDANCE
                 + TIER_GUIDANCE_TEXT
+                + f"{_stage_weight_guidance(packet, 'vision')}\n"
                 + f"soul_packet:{packet}\npreferences:{preferences[-8:]}\nprinciples:{principles[-8:]}\ninstructions:{instructions[-8:]}\nrecent:{recent_visions}\n"
                 + "Prefer subtle variation while preserving continuity with the artist's soul.",
                 90,

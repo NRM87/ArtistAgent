@@ -1,7 +1,7 @@
 ﻿import datetime
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 DEFAULT_CONFIG_FILE = "agent_config.json"
 DEFAULT_ARTISTS_DIR = "artists"
@@ -22,6 +22,7 @@ DEFAULT_SOUL = {
     "current_obsession": "",
     "memories": [],
     "text_memories": [],
+    "review_history": [],
     "creation_count": 0,
     "version": "1.0",
     "cycle_history": [],
@@ -48,6 +49,13 @@ DEFAULT_IMAGE_MODELS = {
     "gemini": "gemini-2.0-flash-exp-image-generation",
 }
 
+DEFAULT_REFLECTION_WEIGHTS = {
+    "vision": 1.0,
+    "refinement": 1.0,
+    "critique": 1.0,
+    "revision": 1.0,
+}
+
 PROVIDER_CAPABILITIES = {
     "openai": {"vision_text": True, "llm": True, "image": True},
     "anthropic": {"vision_text": True, "llm": True, "image": False},
@@ -60,6 +68,7 @@ PROVIDER_CAPABILITIES = {
 
 DEFAULT_PROFILE_CONFIG = {
     "run_policy": "strict",
+    "run_mode": "create",
     "vision_backend": "gemini",
     "vision_model": "gemini-2.5-pro",
     "vision_temperature": 0.4,
@@ -74,6 +83,12 @@ DEFAULT_PROFILE_CONFIG = {
     "ascii_size": "160x60",
     "trace_revision": False,
     "trace_prompts": False,
+    "reviews_per_run": 1,
+    "review_ingest_limit": 5,
+    "reflection_weight_vision": 1.0,
+    "reflection_weight_refinement": 1.0,
+    "reflection_weight_critique": 1.0,
+    "reflection_weight_revision": 1.0,
 }
 
 DEFAULT_ARTIST_MANIFEST = {
@@ -83,6 +98,8 @@ DEFAULT_ARTIST_MANIFEST = {
     "current_obsession": "",
     "gallery_dir": "gallery",
     "memory_sources": [],
+    "review_targets": [],
+    "reflection_weights": {},
 }
 
 @dataclass
@@ -94,6 +111,7 @@ class ParsedVision:
 @dataclass
 class ArtistRuntime:
     artist_id: str
+    artists_dir: Path
     artist_dir: Path
     profile_id: str
     soul_path: Path
@@ -101,6 +119,11 @@ class ArtistRuntime:
     gallery_dir: Path
     lock_path: Path
     run_policy: str
+    run_mode: str
+    reflection_weights: Dict[str, float]
+    reviews_per_run: int
+    review_ingest_limit: int
+    review_targets: List[str]
     memory_sources: List[Path]
 
 class HostedCallError(RuntimeError):

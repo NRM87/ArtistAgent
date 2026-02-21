@@ -26,6 +26,7 @@ from .configuration import (
     ensure_profile_exists,
     load_artist_manifest,
     load_profile_config,
+    resolve_reflection_weights,
     resolve_api_key,
     resolve_effective_profile_id,
 )
@@ -69,6 +70,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--profile", default="")
     p.add_argument("--provider", choices=["gemini", "openai", "anthropic", "ollama", "local", "mock"], default="")
     p.add_argument("--run-policy", choices=["strict", "hybrid", "offline"], default="strict")
+    p.add_argument("--run-mode", choices=["create", "full", "ingest-reviews"], default="create")
     p.add_argument("--contains", default="")
     p.add_argument("--method", default="")
     p.add_argument("--probe", action="store_true")
@@ -90,6 +92,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--image-size", default="1024x1024")
     p.add_argument("--image-fallback", choices=["defer", "mock", "ascii"], default="ascii")
     p.add_argument("--ascii-size", default="160x60")
+    p.add_argument("--reviews-per-run", type=int, default=1)
+    p.add_argument("--review-ingest-limit", type=int, default=5)
+    p.add_argument("--reflection-weight-vision", type=float, default=1.0)
+    p.add_argument("--reflection-weight-refinement", type=float, default=1.0)
+    p.add_argument("--reflection-weight-critique", type=float, default=1.0)
+    p.add_argument("--reflection-weight-revision", type=float, default=1.0)
     if hasattr(argparse, "BooleanOptionalAction"):
         p.add_argument("--trace-revision", action=argparse.BooleanOptionalAction, default=False)
         p.add_argument("--trace-prompts", action=argparse.BooleanOptionalAction, default=False)
@@ -103,6 +111,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--obsession", default="")
     p.add_argument("--empty-obsession", action="store_true")
     p.add_argument("--memory-source", action="append", default=[])
+    p.add_argument("--review-target", action="append", default=[])
     p.add_argument("--force", action="store_true")
     p.add_argument("--non-interactive", action="store_true")
     return p
@@ -200,8 +209,17 @@ def resolve_artist_runtime(args: argparse.Namespace) -> ArtistRuntime:
             setattr(args, k, v)
 
     memory_sources = [artist_root / p for p in manifest.get("memory_sources", []) if isinstance(p, str)]
+    reflection_weights = resolve_reflection_weights(combined, manifest)
+    review_targets = [str(x).strip() for x in (manifest.get("review_targets", []) or []) if str(x).strip()]
+    explicit_review_targets = [str(x).strip() for x in (getattr(args, "review_target", []) or []) if str(x).strip()]
+    if explicit_review_targets:
+        review_targets = explicit_review_targets
+    run_mode = str(getattr(args, "run_mode", "create")).strip().lower() or "create"
+    if run_mode not in ("create", "full", "ingest-reviews"):
+        run_mode = "create"
     return ArtistRuntime(
         artist_id=artist_id,
+        artists_dir=artists_dir,
         artist_dir=artist_root,
         profile_id=profile_id,
         soul_path=artist_root / str(manifest.get("soul_file", "soul.json")),
@@ -209,11 +227,17 @@ def resolve_artist_runtime(args: argparse.Namespace) -> ArtistRuntime:
         gallery_dir=artist_root / str(manifest.get("gallery_dir", "gallery")),
         lock_path=artist_root / ".awaken.lock",
         run_policy=str(getattr(args, "run_policy", "strict")),
+        run_mode=run_mode,
+        reflection_weights=reflection_weights,
+        reviews_per_run=max(0, int(getattr(args, "reviews_per_run", 1))),
+        review_ingest_limit=max(0, int(getattr(args, "review_ingest_limit", 5))),
+        review_targets=review_targets,
         memory_sources=memory_sources,
     )
 
 
 def validate_backend_choices(args: argparse.Namespace) -> None:
+    run_mode = str(getattr(args, "run_mode", "create")).strip().lower() or "create"
     if args.run_policy == "offline":
         # Offline mode forbids hosted dependencies. Keep execution fully local.
         if args.vision_backend not in ("ollama",):
@@ -224,6 +248,13 @@ def validate_backend_choices(args: argparse.Namespace) -> None:
             args.image_backend = "ascii"
         if str(getattr(args, "image_fallback", "ascii")).strip().lower() not in ("ascii", "defer"):
             args.image_fallback = "ascii"
+
+    if run_mode == "ingest-reviews":
+        if not PROVIDER_CAPABILITIES.get(args.llm_backend, {}).get("llm", False):
+            raise ValueError(f"{args.llm_backend} is not supported for review-ingestion LLM backend.")
+        if args.llm_backend == "mock":
+            raise ValueError("Mock critique backend is disabled. Use ollama/openai/anthropic/gemini for review ingestion.")
+        return
 
     if not PROVIDER_CAPABILITIES.get(args.image_backend, {}).get("image", False):
         raise ValueError(f"{args.image_backend} is not supported for image generation backend.")

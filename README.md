@@ -102,11 +102,43 @@ Check backend health:
 python recursive_artist_agent.py check-backends --artist qwen_artist --probe
 ```
 
+Run modes:
+
+```powershell
+python recursive_artist_agent.py run --artist qwen_artist --run-mode create
+python recursive_artist_agent.py run --artist qwen_artist --run-mode full
+python recursive_artist_agent.py run --artist qwen_artist --run-mode ingest-reviews
+```
+
 ## Runtime Policies
 
 - `strict`: disallows deterministic local vision and all mock backends
 - `hybrid`: hosted-first where configured, with explicit ASCII fallback support for image generation
 - `offline`: enforces fully local execution (`vision=ollama`, `llm=ollama`, `image=ascii`)
+
+## Review System
+
+- Cross-artist reviews are persisted per artist under `artists/<id>/reviews/`:
+  - `outbox/` reviews authored by the artist
+  - `inbox/` reviews received from other artists
+  - `processed/` ingested reviews with decision metadata
+- `--run-mode full`:
+  - runs the creation loop
+  - writes structured reviews on other artists' recent gallery work
+  - ingests incoming reviews and updates soul memories when accepted/partially accepted
+- `--run-mode ingest-reviews` runs only review ingestion.
+
+Profile tuning keys:
+- `reviews_per_run`
+- `review_ingest_limit`
+- `reflection_weight_vision`
+- `reflection_weight_refinement`
+- `reflection_weight_critique`
+- `reflection_weight_revision`
+
+Per-artist manifest overrides:
+- `reflection_weights` object
+- `review_targets` list
 
 ## ASCII Fallback
 

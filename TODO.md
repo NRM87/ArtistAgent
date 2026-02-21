@@ -5,23 +5,23 @@ an evolving artist agent with strong self-reflection and autonomous creative beh
 
 ## User-Requested Next Work
 
-- [ ] Refine the self-reflection loop weighting across run stages so the artist feels more actively evolving.
-  - [ ] Revisit weighting per stage:
+- [x] Refine the self-reflection loop weighting across run stages so the artist feels more actively evolving.
+  - [x] Revisit weighting per stage:
     - vision generation
     - iteration prompt refinement
     - critique/judgment
     - soul revision
-  - [ ] Make weighting behavior explicit, inspectable, and easy to tune per profile/artist.
+  - [x] Make weighting behavior explicit, inspectable, and easy to tune per profile/artist.
 
-- [ ] Add cross-artist gallery reviews.
-  - [ ] Let artists view works from other artists' galleries.
-  - [ ] Let artists write structured reviews on other artists' works.
-  - [ ] Persist review artifacts with author/target/timestamp and link to reviewed artwork.
+- [x] Add cross-artist gallery reviews.
+  - [x] Let artists view works from other artists' galleries.
+  - [x] Let artists write structured reviews on other artists' works.
+  - [x] Persist review artifacts with author/target/timestamp and link to reviewed artwork.
 
-- [ ] Add a review-ingestion run mode.
-  - [ ] New run type where an artist reads received reviews.
-  - [ ] Artist evaluates review merit (accept/reject/partial).
-  - [ ] Artist updates soul/memories when it decides reviews are valuable.
+- [x] Add a review-ingestion run mode.
+  - [x] New run type where an artist reads received reviews.
+  - [x] Artist evaluates review merit (accept/reject/partial).
+  - [x] Artist updates soul/memories when it decides reviews are valuable.
 
 ## Suggested Enhancements (Optional)
 
@@ -32,4 +32,3 @@ an evolving artist agent with strong self-reflection and autonomous creative beh
   - [ ] one artist creates
   - [ ] one critiques
   - [ ] creator decides whether to incorporate critique and logs why
-

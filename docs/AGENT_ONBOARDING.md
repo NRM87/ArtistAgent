@@ -30,6 +30,11 @@ Run sequence in `artist_agent/cycle.py`:
 12. Persist soul and cleanup temp
 13. Release lock
 
+Run modes:
+- `create`: creation loop only
+- `full`: creation + outbound cross-artist reviews + inbound review ingestion
+- `ingest-reviews`: inbound review ingestion only
+
 ## Module Responsibilities
 
 `artist_agent/runtime.py`
@@ -81,6 +86,8 @@ Per artist:
   - stable intent/wiring (profile, initial/enforced identity, memory sources)
 - `artists/<id>/soul.json`
   - mutable runtime state (memories/history/evolved identity)
+- `artists/<id>/reviews/`
+  - `outbox/`, `inbox/`, `processed/` review artifacts
 
 Profiles:
 - `profiles/<profile>.json`
@@ -122,6 +129,11 @@ Important distinction:
 - Artist-facing reflective language should remain first-person where feasible (vision/critique/memory notes).
 - Avoid third-person self-reference in generated self-reflection text.
 - Critique should include a concrete next-step command (for prompt refinement), not only abstract commentary.
+
+8. Reflection weighting contract
+- Reflection weights must remain explicit and inspectable per run.
+- Weights should be tunable via profile keys and artist-manifest overrides.
+- Stage keys: `vision`, `refinement`, `critique`, `revision`.
 
 ## Extension Playbook
 

@@ -1,8 +1,9 @@
 ﻿import json
+import datetime
 import os
 import shutil
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from .constants import DEFAULT_SOUL
 
@@ -57,6 +58,8 @@ def load_soul(path: Path) -> Dict:
         soul["memories"] = []
     if not isinstance(soul.get("text_memories"), list):
         soul["text_memories"] = []
+    if not isinstance(soul.get("review_history"), list):
+        soul["review_history"] = []
     if not isinstance(soul.get("cycle_history"), list):
         soul["cycle_history"] = []
     if not isinstance(soul.get("personality_traits"), list):
@@ -237,3 +240,128 @@ def cleanup_gallery_orphans(gallery_dir: Path, memories: List[Dict]) -> int:
             except Exception:
                 pass
     return removed
+
+
+def ensure_review_dirs(artist_dir: Path) -> Dict[str, Path]:
+    root = artist_dir / "reviews"
+    inbox = root / "inbox"
+    outbox = root / "outbox"
+    processed = root / "processed"
+    root.mkdir(parents=True, exist_ok=True)
+    inbox.mkdir(parents=True, exist_ok=True)
+    outbox.mkdir(parents=True, exist_ok=True)
+    processed.mkdir(parents=True, exist_ok=True)
+    return {"root": root, "inbox": inbox, "outbox": outbox, "processed": processed}
+
+
+def _resolve_artifact_path(artist_dir: Path, file_path: str) -> Optional[Path]:
+    raw = str(file_path).strip()
+    if not raw:
+        return None
+    p = Path(raw)
+    candidates = []
+    if p.is_absolute():
+        candidates.append(p)
+    else:
+        candidates.append((Path.cwd() / p).resolve())
+        candidates.append((artist_dir / p).resolve())
+        candidates.append((artist_dir / "gallery" / p.name).resolve())
+    for c in candidates:
+        try:
+            if c.exists() and c.is_file():
+                return c
+        except Exception:
+            continue
+    return None
+
+
+def list_review_candidates(
+    artists_dir: Path,
+    reviewer_artist_id: str,
+    review_targets: List[str],
+    authored_keys: set,
+    limit: int = 20,
+) -> List[Dict]:
+    targets = {str(t).strip() for t in (review_targets or []) if str(t).strip()}
+    out: List[Dict] = []
+    if not artists_dir.exists():
+        return out
+    for artist_root in sorted([p for p in artists_dir.iterdir() if p.is_dir()]):
+        target_artist = artist_root.name
+        if target_artist == reviewer_artist_id:
+            continue
+        if targets and target_artist not in targets:
+            continue
+        soul = load_config_file(artist_root / "soul.json")
+        memories = [m for m in (soul.get("memories", []) or []) if isinstance(m, dict)]
+        for mem in reversed(memories):
+            if str(mem.get("type", "")).strip().lower() != "artwork":
+                continue
+            art_id = int(mem.get("id", 0)) if str(mem.get("id", "")).strip() else 0
+            review_key = f"{target_artist}:{art_id}"
+            if review_key in authored_keys:
+                continue
+            path = _resolve_artifact_path(artist_root, str(mem.get("file_path", "")))
+            if path is None:
+                continue
+            out.append(
+                {
+                    "target_artist": target_artist,
+                    "target_artwork_id": art_id,
+                    "target_artifact_path": str(path).replace("\\", "/"),
+                    "target_vision": str(mem.get("vision", "")).strip(),
+                    "target_score": int(mem.get("final_score", 0)),
+                    "target_timestamp": str(mem.get("timestamp", "")).strip(),
+                    "review_key": review_key,
+                }
+            )
+            break
+    out.sort(key=lambda x: x.get("target_timestamp", ""), reverse=True)
+    return out[: max(0, int(limit))]
+
+
+def persist_cross_artist_review(
+    artists_dir: Path,
+    author_artist_id: str,
+    target_artist_id: str,
+    review: Dict,
+) -> Dict[str, Path]:
+    author_dir = artists_dir / author_artist_id
+    target_dir = artists_dir / target_artist_id
+    author_paths = ensure_review_dirs(author_dir)
+    target_paths = ensure_review_dirs(target_dir)
+
+    review_id = str(review.get("review_id", "")).strip()
+    if not review_id:
+        stamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+        review_id = f"rvw_{author_artist_id}_{target_artist_id}_{stamp}_{abs(hash(str(review))) % 100000:05d}"
+        review["review_id"] = review_id
+
+    outbox_path = author_paths["outbox"] / f"{review_id}.json"
+    inbox_path = target_paths["inbox"] / f"{review_id}.json"
+    atomic_write_json(outbox_path, review)
+    atomic_write_json(inbox_path, review)
+    return {"outbox": outbox_path, "inbox": inbox_path}
+
+
+def load_inbox_reviews(artist_dir: Path, limit: int = 10) -> List[Tuple[Path, Dict]]:
+    paths = ensure_review_dirs(artist_dir)
+    files = sorted([p for p in paths["inbox"].iterdir() if p.is_file() and p.suffix.lower() == ".json"])
+    out: List[Tuple[Path, Dict]] = []
+    for p in files[: max(0, int(limit))]:
+        payload = load_config_file(p)
+        if payload:
+            out.append((p, payload))
+    return out
+
+
+def archive_inbox_review(artist_dir: Path, inbox_path: Path, payload: Dict) -> Optional[Path]:
+    paths = ensure_review_dirs(artist_dir)
+    name = inbox_path.name if inbox_path.name else f"review_{datetime.datetime.now().strftime('%H%M%S')}.json"
+    target = paths["processed"] / name
+    try:
+        atomic_write_json(target, payload)
+        inbox_path.unlink(missing_ok=True)
+        return target
+    except Exception:
+        return None

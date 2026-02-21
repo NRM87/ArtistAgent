@@ -120,6 +120,10 @@ def configure_models(args) -> None:
             if val:
                 if key in ("vision_temperature", "llm_temperature"):
                     profile[key] = float(val)
+                elif key in ("reviews_per_run", "review_ingest_limit"):
+                    profile[key] = int(val)
+                elif key.startswith("reflection_weight_"):
+                    profile[key] = float(val)
                 elif key in ("trace_revision", "trace_prompts"):
                     profile[key] = val.strip().lower() in ("1", "true", "yes", "on")
                 else:
