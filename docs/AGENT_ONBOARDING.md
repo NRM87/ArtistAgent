@@ -169,6 +169,7 @@ Current tests emphasize:
 - locking correctness
 - memory consolidation rules
 - fallback behavior (including ASCII path)
+- hosted image generation path behavior (prompt normalization, response extraction, fallback/fail-closed)
 - provider model row extraction/inference
 
 When adding functionality:

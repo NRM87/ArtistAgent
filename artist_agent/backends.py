@@ -769,6 +769,58 @@ class HostedImageBackend(ImageBackend):
     def _http_json(self, url: str, payload: Dict, headers: Dict) -> Dict:
         return _post_json_with_retry(url=url, payload=payload, headers=headers, timeout=70)
 
+    @staticmethod
+    def _strip_wrapping_quotes(text: str) -> str:
+        v = str(text).strip()
+        if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+            v = v[1:-1].strip()
+        return v
+
+    @classmethod
+    def _normalize_model_prompt(cls, prompt: str, max_chars: int = 1800) -> str:
+        raw = str(prompt).replace("\r\n", "\n").replace("\r", "\n")
+        run_vision = cls._strip_wrapping_quotes(_extract_labeled_value(raw, "Run vision (fixed for this run)"))
+        iter_prompt = cls._strip_wrapping_quotes(_extract_labeled_value(raw, "Iteration image prompt"))
+        if iter_prompt:
+            model_prompt = iter_prompt
+            if run_vision:
+                model_prompt += f"\n\nStay faithful to this run vision: {run_vision}"
+        else:
+            model_prompt = " ".join(raw.split())
+        model_prompt = re.sub(r"\s+", " ", model_prompt).strip()
+        return model_prompt[:max_chars]
+
+    @staticmethod
+    def _download_bytes(url: str) -> bytes:
+        req = urllib.request.Request(url=url, method="GET")
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = resp.read()
+        if not data:
+            raise ValueError("Downloaded image URL returned empty payload.")
+        return data
+
+    @classmethod
+    def _extract_openai_image_bytes(cls, payload: Dict) -> bytes:
+        rows = payload.get("data", []) or []
+        for row in rows:
+            b64 = str(row.get("b64_json", "")).strip()
+            if b64:
+                return base64.b64decode(b64)
+            url = str(row.get("url", "")).strip()
+            if url:
+                return cls._download_bytes(url)
+        raise ValueError("OpenAI response missing image data.")
+
+    @staticmethod
+    def _extract_gemini_inline_b64(payload: Dict) -> str:
+        for cand in payload.get("candidates", []) or []:
+            for part in cand.get("content", {}).get("parts", []) or []:
+                inline = part.get("inlineData") or part.get("inline_data") or {}
+                b64 = str(inline.get("data", "")).strip()
+                if b64:
+                    return b64
+        return ""
+
     def _write_image_bytes(self, creation_id: int, iteration: int, data: bytes) -> str:
         path = self.temp_dir / f"img_{creation_id:04d}_iter_{iteration}.png"
         path.write_bytes(data)
@@ -776,6 +828,7 @@ class HostedImageBackend(ImageBackend):
 
     def generate(self, prompt: str, iteration: int, creation_id: int) -> str:
         try:
+            model_prompt = self._normalize_model_prompt(prompt)
             if self.provider == "openai":
                 _trace_prompt(
                     self.trace_prompts,
@@ -783,17 +836,14 @@ class HostedImageBackend(ImageBackend):
                     self.provider,
                     self.model,
                     "Generate an image from prompt.",
-                    f"prompt:{prompt}\nsize:{self.size}",
+                    f"prompt:{model_prompt}\nsize:{self.size}",
                 )
                 out = self._http_json(
                     "https://api.openai.com/v1/images/generations",
-                    {"model": self.model, "prompt": prompt, "size": self.size, "response_format": "b64_json"},
+                    {"model": self.model, "prompt": model_prompt, "size": self.size, "response_format": "b64_json"},
                     {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
                 )
-                b64 = out.get("data", [{}])[0].get("b64_json", "")
-                if not b64:
-                    raise ValueError("OpenAI response missing image data.")
-                return self._write_image_bytes(creation_id, iteration, base64.b64decode(b64))
+                return self._write_image_bytes(creation_id, iteration, self._extract_openai_image_bytes(out))
 
             if self.provider == "gemini":
                 _trace_prompt(
@@ -802,16 +852,25 @@ class HostedImageBackend(ImageBackend):
                     self.provider,
                     self.model,
                     "Create an image from prompt.",
-                    f"prompt:{prompt}\nsize:{self.size}",
+                    f"prompt:{model_prompt}\nsize:{self.size}",
                 )
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{urllib.parse.quote(self.model)}:generateContent?key={urllib.parse.quote(self.api_key)}"
-                out = self._http_json(url, {"contents": [{"parts": [{"text": f"Create an image: {prompt}"}]}], "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}}, {"Content-Type": "application/json"})
-                for cand in out.get("candidates", []):
-                    for part in cand.get("content", {}).get("parts", []):
-                        b64 = part.get("inlineData", {}).get("data")
-                        if b64:
-                            return self._write_image_bytes(creation_id, iteration, base64.b64decode(b64))
-                raise ValueError("Gemini did not return inline image data.")
+                payload = {
+                    "contents": [{"parts": [{"text": f"Create a single image only. Target size {self.size}. Prompt: {model_prompt}"}]}],
+                    "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
+                }
+                out = self._http_json(url, payload, {"Content-Type": "application/json"})
+                b64 = self._extract_gemini_inline_b64(out)
+                if not b64:
+                    retry_payload = {
+                        "contents": [{"parts": [{"text": f"Return IMAGE modality output only. Target size {self.size}. Prompt: {model_prompt}"}]}],
+                        "generationConfig": {"responseModalities": ["IMAGE"]},
+                    }
+                    out = self._http_json(url, retry_payload, {"Content-Type": "application/json"})
+                    b64 = self._extract_gemini_inline_b64(out)
+                if not b64:
+                    raise ValueError("Gemini did not return inline image data.")
+                return self._write_image_bytes(creation_id, iteration, base64.b64decode(b64))
 
             raise ValueError(f"Unsupported image provider: {self.provider}")
         except Exception as exc:

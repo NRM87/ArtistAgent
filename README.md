@@ -19,6 +19,7 @@ The project supports hosted providers (Gemini/OpenAI/Anthropic), local Ollama mo
 - Fixed run vision with iterative image-prompt refinement per run
 - Action-oriented vision contract (`My vision for this run is to ...`) with defensive normalization for weak models
 - Critique outputs include a concrete `NEXT_ACTION` command that feeds prompt refinement
+- Hosted image path normalizes loop prompts into model-ready visual prompts (not ASCII-only tuning)
 - Tolerant labeled-field parsing for weak local models (no strict JSON dependency in loop decisions)
 - First-person artist voice for vision, critique, and reflection
 - Stale lock recovery for interrupted runs
