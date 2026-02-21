@@ -28,7 +28,7 @@ def test_build_hosted_llm_without_key_raises_in_hybrid(monkeypatch):
 
 def test_ollama_critique_fails_closed(monkeypatch):
     backend = OllamaLLMBackend(model="qwen2.5:3b")
-    monkeypatch.setattr(backend, "_chat_json", _raise_runtime_error)
+    monkeypatch.setattr(backend, "_chat_text", _raise_runtime_error)
     with pytest.raises(HostedCallError):
         backend.critique("ignored.txt", "vision", 0)
 
@@ -40,6 +40,6 @@ def test_hosted_critique_fails_closed_even_when_allow_fallback(monkeypatch):
         api_key="test-key",
         allow_fallback=True,
     )
-    monkeypatch.setattr(backend, "_chat_json", _raise_runtime_error)
+    monkeypatch.setattr(backend, "_chat_text", _raise_runtime_error)
     with pytest.raises(HostedCallError):
         backend.critique("ignored.txt", "vision", 0)
