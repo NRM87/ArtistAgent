@@ -106,6 +106,7 @@ def ensure_llm_identity(soul: Dict, llm_backend) -> None:
 
 
 def build_critique_frame(soul: Dict, run_intent: Dict) -> str:
+    artist_name = str(soul.get("name", "")).strip()
     traits = [str(t).strip() for t in soul.get("personality_traits", []) if str(t).strip()][:10]
     obsession = str(soul.get("current_obsession", "")).strip()
     text_mem = soul.get("text_memories", [])[-10:]
@@ -113,6 +114,7 @@ def build_critique_frame(soul: Dict, run_intent: Dict) -> str:
     history = soul.get("cycle_history", [])[-8:]
     reflection_weights = soul.get("reflection_weights", {})
     return (
+        f"artist_name:{artist_name}\n"
         f"personality_traits:{traits}\n"
         f"current_obsession:{obsession}\n"
         f"text_memories:{text_mem}\n"
@@ -470,7 +472,10 @@ def run() -> None:
 
         run_intent = normalize_run_intent({})
         try:
-            run_intent = normalize_run_intent(llm_backend.generate_run_intent(soul_for_guidance))
+            run_intent = normalize_run_intent(
+                llm_backend.generate_run_intent(soul_for_guidance),
+                self_name=str(soul_for_guidance.get("name", "")).strip(),
+            )
         except Exception as exc:
             print(f"Run intent generation skipped: {exc}")
         if getattr(args, "trace_revision", False):

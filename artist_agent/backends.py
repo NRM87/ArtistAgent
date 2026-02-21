@@ -32,9 +32,12 @@ TIER_GUIDANCE_TEXT = (
     "failures indicate pitfalls to avoid repeating.\n"
 )
 SOUL_CONTEXT_GUIDANCE = (
-    "Ground decisions in the artist's personality traits, obsession, text memories, artwork memories, and recent history.\n"
+    "Ground decisions in your personality traits, obsession, text memories, artwork memories, and recent history.\n"
 )
-FIRST_PERSON_HINT = "Use first-person voice (I/me/my) when expressing artistic intent, critique, and reflection.\n"
+FIRST_PERSON_HINT = (
+    "Use first-person voice (I/me/my) when expressing artistic intent, critique, and reflection. "
+    "Never refer to yourself by your artist name.\n"
+)
 REVISION_ACTION_HINT = "Prefer concrete commitments over abstract commentary when proposing soul revisions.\n"
 ACTION_VISION_CONTRACT = (
     "Return exactly one line in this format:\n"
@@ -181,7 +184,37 @@ def _contains_first_person(text: str) -> bool:
     return bool(re.search(r"\b(i|me|my|mine|myself)\b", str(text), flags=re.I))
 
 
-def _extract_image_prompt(raw: str, current_prompt: str) -> str:
+def _self_name_patterns(self_name: str) -> List[Tuple[str, str]]:
+    name = str(self_name).strip()
+    if not name:
+        return []
+    esc = re.escape(name)
+    return [
+        (rf"(?i)\b{esc}'s\b", "my"),
+        (rf"(?i)\b{esc}\s+should\b", "I should"),
+        (rf"(?i)\b{esc}\s+will\b", "I will"),
+        (rf"(?i)\b{esc}\s+wants?\b", "I want"),
+        (rf"(?i)\b{esc}\s+needs?\b", "I need"),
+        (rf"(?i)\b{esc}\s+prefers?\b", "I prefer"),
+    ]
+
+
+def _normalize_self_reference(text: str, self_name: str = "") -> str:
+    value = str(text)
+    patterns: List[Tuple[str, str]] = [
+        (r"(?i)\bthe artist's\b", "my"),
+        (r"(?i)\bthis artist's\b", "my"),
+    ] + _self_name_patterns(self_name)
+    for pattern, replacement in patterns:
+        value = re.sub(pattern, replacement, value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _extract_artist_name_from_frame(frame: str) -> str:
+    return _extract_labeled_value(str(frame), "artist_name")
+
+
+def _extract_image_prompt(raw: str, current_prompt: str, self_name: str = "") -> str:
     text = str(raw)
     for start, end in (
         ("IMAGE_PROMPT_START", "IMAGE_PROMPT_END"),
@@ -190,12 +223,12 @@ def _extract_image_prompt(raw: str, current_prompt: str) -> str:
     ):
         block = _extract_block(text, start, end)
         if block:
-            return _normalize_prompt_text(block)
+            return _normalize_self_reference(_normalize_prompt_text(block), self_name)
 
     for label in ("image_prompt", "revised_prompt", "vision_refined"):
         value = _extract_labeled_value(text, label)
         if value:
-            return _normalize_prompt_text(value)
+            return _normalize_self_reference(_normalize_prompt_text(value), self_name)
 
     # Last-resort fallback: accept a single clean line only.
     first = _first_nonempty_line(text)
@@ -212,7 +245,7 @@ def _extract_image_prompt(raw: str, current_prompt: str) -> str:
                 "keep continuity",
             )
         ):
-            return _normalize_prompt_text(first)
+            return _normalize_self_reference(_normalize_prompt_text(first), self_name)
     return current_prompt
 
 
@@ -240,7 +273,7 @@ def _looks_meta_vision(text: str) -> bool:
     return any(token in probe for token in blocked)
 
 
-def _normalize_action_command(raw: str) -> str:
+def _normalize_action_command(raw: str, self_name: str = "") -> str:
     value = " ".join(str(raw).replace("\r\n", "\n").replace("\r", "\n").split()).strip()
     value = value.strip('"').strip("'")
     value = re.sub(r"(?i)^next_action\s*[:=-]\s*", "", value).strip()
@@ -249,6 +282,7 @@ def _normalize_action_command(raw: str) -> str:
         "",
         value,
     ).strip()
+    value = _normalize_self_reference(value, self_name)
     value = re.sub(r"(?i)^to\s+", "", value).strip()
     value = value.strip(" .,:;-")
     if not value or _looks_meta_vision(value):
@@ -275,7 +309,7 @@ def _normalize_action_vision(raw: str, soul: Optional[Dict] = None) -> str:
     if not candidate:
         candidate = ""
 
-    body = candidate
+    body = _normalize_self_reference(candidate, str((soul or {}).get("name", "")).strip())
     lower = body.lower()
     if lower.startswith("my vision for this run is to "):
         body = body[len("my vision for this run is to ") :].strip()
@@ -1076,6 +1110,7 @@ class OllamaLLMBackend(LLMBackend):
 
     def critique(self, image_path: str, vision: str, iteration: int, critique_frame: str = "") -> Dict:
         try:
+            artist_name = _extract_artist_name_from_frame(critique_frame)
             raw = self._chat_text(
                 "Evaluate this artwork and respond using exactly three lines:\n"
                 "SCORE: <integer 1-10>\n"
@@ -1102,6 +1137,7 @@ class OllamaLLMBackend(LLMBackend):
                     image_path=image_path,
                 )
                 feedback = _first_nonempty_line(feedback_raw)
+            feedback = _normalize_self_reference(feedback, artist_name)
             if feedback and not _contains_first_person(feedback):
                 fp_raw = self._chat_text(
                     "Rewrite in first person only. Return one sentence.",
@@ -1109,10 +1145,12 @@ class OllamaLLMBackend(LLMBackend):
                     image_path=image_path,
                 )
                 feedback = _first_nonempty_line(fp_raw) or feedback
+            feedback = _normalize_self_reference(feedback, artist_name)
             next_action = _normalize_action_command(
                 _extract_labeled_value(raw, "next_action")
                 or _extract_labeled_value(raw, "action")
-                or ""
+                or "",
+                artist_name,
             )
             if not next_action:
                 action_raw = self._chat_text(
@@ -1120,7 +1158,7 @@ class OllamaLLMBackend(LLMBackend):
                     f"vision:{vision}\niteration:{iteration}\nscore:{parsed_score}\nfeedback:{feedback}",
                     image_path=image_path,
                 )
-                next_action = _normalize_action_command(action_raw)
+                next_action = _normalize_action_command(action_raw, artist_name)
             if not feedback:
                 raise ValueError("Could not parse critique feedback.")
             return {"score": parsed_score, "feedback": feedback, "next_action": next_action}
@@ -1245,7 +1283,8 @@ class OllamaLLMBackend(LLMBackend):
                 "VISION_DIRECTIVE: <imperative command for the next image prompt>\n"
                 "CRITIQUE_DIRECTIVE: <imperative command for how to judge/score>\n"
                 "REVISION_DIRECTIVE: <imperative command for what to revise in soul>\n"
-                "Do not output first-person reflections or policy summaries.",
+                "Use first-person phrasing and never use the artist name.\n"
+                "Do not output policy summaries.",
                 context,
             )
             vd = _extract_labeled_value(out, "vision_directive")
@@ -1285,7 +1324,7 @@ class OllamaLLMBackend(LLMBackend):
                     "Keep continuity with the fixed run vision while improving the next image attempt."
                 )
             )
-            next_prompt = _extract_image_prompt(out, current_prompt)
+            next_prompt = _extract_image_prompt(out, current_prompt, str(soul_data.get("name", "")).strip())
             if next_prompt == current_prompt:
                 retry = self._chat_text(
                     "Respond with exactly one line: IMAGE_PROMPT: <text>",
@@ -1296,7 +1335,7 @@ class OllamaLLMBackend(LLMBackend):
                         f"score:{int(score)}\n"
                     ),
                 )
-                next_prompt = _extract_image_prompt(retry, current_prompt)
+                next_prompt = _extract_image_prompt(retry, current_prompt, str(soul_data.get("name", "")).strip())
             return next_prompt or current_prompt
         except Exception as exc:
             raise HostedCallError(f"Ollama prompt refinement failed: {exc}") from exc
@@ -1469,6 +1508,7 @@ class HostedLLMBackend(LLMBackend):
 
     def critique(self, image_path: str, vision: str, iteration: int, critique_frame: str = "") -> Dict:
         try:
+            artist_name = _extract_artist_name_from_frame(critique_frame)
             raw = self._chat_text(
                 "Evaluate this artwork and respond using exactly three lines:\n"
                 "SCORE: <integer 1-10>\n"
@@ -1498,6 +1538,7 @@ class HostedLLMBackend(LLMBackend):
                     image_path,
                 )
                 feedback = _first_nonempty_line(feedback_raw)
+            feedback = _normalize_self_reference(feedback, artist_name)
             if feedback and not _contains_first_person(feedback):
                 fp_raw = self._chat_text(
                     "Rewrite in first person only. Return one sentence.",
@@ -1506,10 +1547,12 @@ class HostedLLMBackend(LLMBackend):
                     image_path,
                 )
                 feedback = _first_nonempty_line(fp_raw) or feedback
+            feedback = _normalize_self_reference(feedback, artist_name)
             next_action = _normalize_action_command(
                 _extract_labeled_value(raw, "next_action")
                 or _extract_labeled_value(raw, "action")
-                or ""
+                or "",
+                artist_name,
             )
             if not next_action:
                 action_raw = self._chat_text(
@@ -1518,7 +1561,7 @@ class HostedLLMBackend(LLMBackend):
                     120,
                     image_path,
                 )
-                next_action = _normalize_action_command(action_raw)
+                next_action = _normalize_action_command(action_raw, artist_name)
             if not feedback:
                 raise ValueError("Could not parse critique feedback.")
             return {"score": parsed_score, "feedback": feedback, "next_action": next_action}
@@ -1641,7 +1684,8 @@ class HostedLLMBackend(LLMBackend):
                 "VISION_DIRECTIVE: <imperative command for the next image prompt>\n"
                 "CRITIQUE_DIRECTIVE: <imperative command for how to judge/score>\n"
                 "REVISION_DIRECTIVE: <imperative command for what to revise in soul>\n"
-                "Do not output first-person reflections or policy summaries.",
+                "Use first-person phrasing and never use the artist name.\n"
+                "Do not output policy summaries.",
                 (
                     FIRST_PERSON_HINT
                     + SOUL_CONTEXT_GUIDANCE
@@ -1689,7 +1733,7 @@ class HostedLLMBackend(LLMBackend):
                 ),
                 300,
             )
-            next_prompt = _extract_image_prompt(out, current_prompt)
+            next_prompt = _extract_image_prompt(out, current_prompt, str(soul_data.get("name", "")).strip())
             if next_prompt == current_prompt:
                 retry = self._chat_text(
                     "Respond with exactly one line: IMAGE_PROMPT: <text>",
@@ -1701,7 +1745,7 @@ class HostedLLMBackend(LLMBackend):
                     ),
                     120,
                 )
-                next_prompt = _extract_image_prompt(retry, current_prompt)
+                next_prompt = _extract_image_prompt(retry, current_prompt, str(soul_data.get("name", "")).strip())
             return next_prompt or current_prompt
         except Exception as exc:
             raise HostedCallError(f"Hosted prompt refinement failed: {exc}") from exc

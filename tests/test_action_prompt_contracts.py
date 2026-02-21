@@ -60,3 +60,36 @@ def test_normalize_action_vision_keeps_labeled_command_output():
 def test_normalize_action_command_converts_to_imperative():
     action = _normalize_action_command("NEXT_ACTION: I will increase edge contrast around the focal square")
     assert action.lower().startswith("increase edge contrast")
+
+
+def test_normalize_run_intent_rewrites_artist_name_possessive():
+    out = normalize_run_intent(
+        {
+            "vision_directive": "Create something reflecting Lyra's ideals through geometry",
+            "critique_directive": "Score by Lyra's values before aesthetics",
+            "revision_directive": "Record learning that matches Lyra's priorities",
+        },
+        self_name="Lyra",
+    )
+    assert "lyra's" not in out["vision_directive"].lower()
+    assert "my ideals" in out["vision_directive"].lower()
+    assert "my values" in out["critique_directive"].lower()
+    assert "my priorities" in out["revision_directive"].lower()
+
+
+def test_normalize_action_vision_rewrites_artist_name_possessive():
+    vision = _normalize_action_vision(
+        "RUN_VISION: My vision for this run is to create an image reflecting Lyra's ideals with rigid perspective.",
+        soul={"name": "Lyra", "current_obsession": "Rigid perspective"},
+    )
+    assert "lyra's" not in vision.lower()
+    assert "my ideals" in vision.lower()
+
+
+def test_normalize_action_command_rewrites_artist_name_possessive():
+    action = _normalize_action_command(
+        "NEXT_ACTION: Increase contrast to match Lyra's ideals in the focal area.",
+        self_name="Lyra",
+    )
+    assert "lyra's" not in action.lower()
+    assert "my ideals" in action.lower()

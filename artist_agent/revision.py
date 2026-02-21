@@ -68,14 +68,39 @@ def _normalize_directive(raw: str, default: str) -> str:
     return value
 
 
-def normalize_run_intent(intent: Dict) -> Dict:
+def _normalize_self_reference(text: str, self_name: str = "") -> str:
+    value = str(text)
+    value = re.sub(r"(?i)\bthe artist's\b", "my", value)
+    value = re.sub(r"(?i)\bthis artist's\b", "my", value)
+    name = str(self_name).strip()
+    if name:
+        esc = re.escape(name)
+        value = re.sub(rf"(?i)\b{esc}'s\b", "my", value)
+        value = re.sub(rf"(?i)\b{esc}\s+should\b", "I should", value)
+        value = re.sub(rf"(?i)\b{esc}\s+will\b", "I will", value)
+        value = re.sub(rf"(?i)\b{esc}\s+wants?\b", "I want", value)
+        value = re.sub(rf"(?i)\b{esc}\s+needs?\b", "I need", value)
+        value = re.sub(rf"(?i)\b{esc}\s+prefers?\b", "I prefer", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def normalize_run_intent(intent: Dict, self_name: str = "") -> Dict:
     if not isinstance(intent, dict):
         intent = {}
 
     return {
-        "vision_directive": _normalize_directive(intent.get("vision_directive", ""), DEFAULT_VISION_DIRECTIVE),
-        "critique_directive": _normalize_directive(intent.get("critique_directive", ""), DEFAULT_CRITIQUE_DIRECTIVE),
-        "revision_directive": _normalize_directive(intent.get("revision_directive", ""), DEFAULT_REVISION_DIRECTIVE),
+        "vision_directive": _normalize_directive(
+            _normalize_self_reference(intent.get("vision_directive", ""), self_name),
+            DEFAULT_VISION_DIRECTIVE,
+        ),
+        "critique_directive": _normalize_directive(
+            _normalize_self_reference(intent.get("critique_directive", ""), self_name),
+            DEFAULT_CRITIQUE_DIRECTIVE,
+        ),
+        "revision_directive": _normalize_directive(
+            _normalize_self_reference(intent.get("revision_directive", ""), self_name),
+            DEFAULT_REVISION_DIRECTIVE,
+        ),
     }
 
 
