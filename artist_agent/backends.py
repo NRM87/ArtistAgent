@@ -35,6 +35,18 @@ SOUL_CONTEXT_GUIDANCE = (
     "Ground decisions in the artist's personality traits, obsession, text memories, artwork memories, and recent history.\n"
 )
 FIRST_PERSON_HINT = "Use first-person voice (I/me/my) when expressing artistic intent, critique, and reflection.\n"
+REVISION_ACTION_HINT = "Prefer concrete commitments over abstract commentary when proposing soul revisions.\n"
+ACTION_VISION_CONTRACT = (
+    "Return exactly one line in this format:\n"
+    "RUN_VISION: My vision for this run is to create <one concrete image goal>.\n"
+    "Keep it visual and specific (subject, composition, mood). "
+    "Do not output policy statements, context summaries, or instruction echoes."
+)
+ACTION_VERB_PATTERN = (
+    r"(?i)^(create|compose|render|paint|draw|depict|illustrate|craft|focus|judge|score|identify|compare|"
+    r"revise|update|record|preserve|avoid|tighten|strengthen|reduce|increase|add|remove|keep|test|check|"
+    r"emphasize|clarify|balance|shift|improve|use|try|set)\b"
+)
 
 
 def _post_json_with_retry(url: str, payload: Dict, headers: Dict, timeout: int, attempts: int = 5) -> Dict:
@@ -202,6 +214,96 @@ def _extract_image_prompt(raw: str, current_prompt: str) -> str:
         ):
             return _normalize_prompt_text(first)
     return current_prompt
+
+
+def _looks_meta_vision(text: str) -> bool:
+    probe = str(text).strip().lower()
+    if not probe:
+        return True
+    blocked = (
+        "artwork tiers",
+        "guide decisions",
+        "soul packet",
+        "soul context",
+        "personality_traits:",
+        "text_memories:",
+        "artwork_memories:",
+        "history:",
+        "preferences:",
+        "principles:",
+        "instructions:",
+        "respond using",
+        "return exactly",
+        "<",
+        ">",
+    )
+    return any(token in probe for token in blocked)
+
+
+def _normalize_action_command(raw: str) -> str:
+    value = " ".join(str(raw).replace("\r\n", "\n").replace("\r", "\n").split()).strip()
+    value = value.strip('"').strip("'")
+    value = re.sub(r"(?i)^next_action\s*[:=-]\s*", "", value).strip()
+    value = re.sub(
+        r"(?i)^(i\s+(will|want to|intend to|need to|should|am going to)\s+|my\s+next\s+action\s+is\s+to\s+)",
+        "",
+        value,
+    ).strip()
+    value = re.sub(r"(?i)^to\s+", "", value).strip()
+    value = value.strip(" .,:;-")
+    if not value or _looks_meta_vision(value):
+        return ""
+    if not re.match(ACTION_VERB_PATTERN, value):
+        value = f"Emphasize {value[0].lower() + value[1:]}" if len(value) > 1 else ""
+    value = value[:180].strip()
+    if not value:
+        return ""
+    if not value.endswith((".", "!", "?")):
+        value += "."
+    return value
+
+
+def _normalize_action_vision(raw: str, soul: Optional[Dict] = None) -> str:
+    text = str(raw).replace("\r\n", "\n").replace("\r", "\n")
+    candidate = (
+        _extract_labeled_value(text, "run_vision")
+        or _extract_labeled_value(text, "vision")
+        or _extract_labeled_value(text, "my_vision")
+        or _first_nonempty_line(text)
+    )
+    candidate = " ".join(candidate.split()).strip().strip('"').strip("'")
+    if not candidate:
+        candidate = ""
+
+    body = candidate
+    lower = body.lower()
+    if lower.startswith("my vision for this run is to "):
+        body = body[len("my vision for this run is to ") :].strip()
+    elif lower.startswith("my vision for this run is "):
+        body = body[len("my vision for this run is ") :].strip()
+    body = re.sub(
+        r"(?i)^(i\s+(will|want to|intend to|need to|should|am going to)\s+|my\s+(goal|focus|plan)\s+is\s+to\s+)",
+        "",
+        body,
+    ).strip()
+    body = re.sub(r"(?i)^to\s+", "", body).strip(" .,:;-")
+
+    if _looks_meta_vision(body):
+        body = ""
+    if body and not re.match(ACTION_VERB_PATTERN, body):
+        body = f"Create an image that {body[0].lower() + body[1:]}" if len(body) > 1 else ""
+    if not body:
+        obsession = str((soul or {}).get("current_obsession", "")).strip()
+        if obsession:
+            body = f"create an image that explores {obsession.lower()} with a clear focal subject and composition"
+        else:
+            body = "create a concrete image with a clear focal subject, composition, and mood"
+
+    body = body[:220].strip()
+    body = re.sub(r"(?i)^to\s+", "", body).strip()
+    if not body.endswith((".", "!", "?")):
+        body += "."
+    return f"My vision for this run is to {body[0].lower() + body[1:] if body and body[0].isupper() else body}"
 
 
 def _ollama_generate_text(base_url: str, model: str, prompt: str, temperature: float, timeout: int = 60) -> str:
@@ -769,7 +871,12 @@ class MockLLM:
             "Strong structure. Push atmosphere and precision further." if score <= 7 else
             "Now the concept resonates with confidence and clarity."
         )
-        return {"score": int(score), "feedback": feedback}
+        next_action = (
+            "Increase focal contrast and simplify the scene hierarchy." if score <= 5 else
+            "Strengthen depth cues and clarify the primary subject." if score <= 7 else
+            "Preserve the composition and tighten detail precision."
+        )
+        return {"score": int(score), "feedback": feedback, "next_action": next_action}
 
     @staticmethod
     def judge_worthiness(image_path: str, score: int, vision: str) -> bool:
@@ -868,9 +975,10 @@ class OllamaLLMBackend(LLMBackend):
     def critique(self, image_path: str, vision: str, iteration: int, critique_frame: str = "") -> Dict:
         try:
             raw = self._chat_text(
-                "Evaluate this artwork and respond using exactly two lines:\n"
+                "Evaluate this artwork and respond using exactly three lines:\n"
                 "SCORE: <integer 1-10>\n"
-                "FEEDBACK: <one concise critique sentence in first person>",
+                "FEEDBACK: <one concise critique sentence in first person>\n"
+                "NEXT_ACTION: <one concrete command for the next image attempt>",
                 f"vision:{vision}\niteration:{iteration}\ncritique_frame:{critique_frame}",
                 image_path=image_path,
             )
@@ -899,9 +1007,21 @@ class OllamaLLMBackend(LLMBackend):
                     image_path=image_path,
                 )
                 feedback = _first_nonempty_line(fp_raw) or feedback
+            next_action = _normalize_action_command(
+                _extract_labeled_value(raw, "next_action")
+                or _extract_labeled_value(raw, "action")
+                or ""
+            )
+            if not next_action:
+                action_raw = self._chat_text(
+                    "Respond with exactly one line: NEXT_ACTION: <one concrete command for the next image prompt>.",
+                    f"vision:{vision}\niteration:{iteration}\nscore:{parsed_score}\nfeedback:{feedback}",
+                    image_path=image_path,
+                )
+                next_action = _normalize_action_command(action_raw)
             if not feedback:
                 raise ValueError("Could not parse critique feedback.")
-            return {"score": parsed_score, "feedback": feedback}
+            return {"score": parsed_score, "feedback": feedback, "next_action": next_action}
         except Exception as exc:
             raise HostedCallError(f"Ollama critique failed: {exc}") from exc
 
@@ -991,7 +1111,7 @@ class OllamaLLMBackend(LLMBackend):
             recent = [m.get("vision", "") for m in memories[-8:]]
             packet = build_soul_packet(soul)
             text = self._chat_text(
-                "Return exactly one concise art vision sentence in first person. No JSON. No bullet points.",
+                ACTION_VISION_CONTRACT,
                 (
                     SOUL_CONTEXT_GUIDANCE
                     + FIRST_PERSON_HINT
@@ -1000,10 +1120,7 @@ class OllamaLLMBackend(LLMBackend):
                     + "Prefer meaningful variation in composition while preserving continuity with the artist's soul."
                 ),
             )
-            vision = text.strip().strip('"').splitlines()[0].strip()
-            if vision and not _contains_first_person(vision):
-                rewrite = self._chat_text("Rewrite this vision in first person. One sentence only.", f"vision:{vision}")
-                vision = _first_nonempty_line(rewrite) or vision
+            vision = _normalize_action_vision(text, soul)
             if not vision:
                 raise HostedCallError("LLM vision fallback returned empty vision.")
             return vision
@@ -1021,20 +1138,15 @@ class OllamaLLMBackend(LLMBackend):
             )
             out = self._chat_text(
                 "Respond using three lines:\n"
-                "VISION_DIRECTIVE: <first-person text, <= 140 chars>\n"
-                "CRITIQUE_DIRECTIVE: <first-person text, <= 140 chars>\n"
-                "REVISION_DIRECTIVE: <first-person text, <= 140 chars>",
+                "VISION_DIRECTIVE: <imperative command for the next image prompt>\n"
+                "CRITIQUE_DIRECTIVE: <imperative command for how to judge/score>\n"
+                "REVISION_DIRECTIVE: <imperative command for what to revise in soul>\n"
+                "Do not output first-person reflections or policy summaries.",
                 context,
             )
             vd = _extract_labeled_value(out, "vision_directive")
             cd = _extract_labeled_value(out, "critique_directive")
             rd = _extract_labeled_value(out, "revision_directive")
-            if vd and not _contains_first_person(vd):
-                vd = f"I will {vd[:120].lstrip()}"
-            if cd and not _contains_first_person(cd):
-                cd = f"I will {cd[:120].lstrip()}"
-            if rd and not _contains_first_person(rd):
-                rd = f"I will {rd[:120].lstrip()}"
             return {"vision_directive": vd, "critique_directive": cd, "revision_directive": rd}
         except Exception as exc:
             raise HostedCallError(f"Ollama run-intent generation failed: {exc}") from exc
@@ -1054,7 +1166,8 @@ class OllamaLLMBackend(LLMBackend):
             out = self._chat_text(
                 "You are revising only the iteration image prompt for the next attempt.\n"
                 "The run vision is fixed and must not be rewritten.\n"
-                "Make minimal, targeted edits to CURRENT_IMAGE_PROMPT using critique feedback.\n"
+                "Apply the critique feedback as concrete visual editing commands.\n"
+                "Make minimal, targeted edits to CURRENT_IMAGE_PROMPT.\n"
                 "Return exactly one line in this format:\n"
                 "IMAGE_PROMPT: <revised prompt text>",
                 (
@@ -1089,6 +1202,7 @@ class OllamaLLMBackend(LLMBackend):
             context = (
                 SOUL_CONTEXT_GUIDANCE
                 + TIER_GUIDANCE_TEXT
+                + REVISION_ACTION_HINT
                 + f"soul_packet:{packet}\ncreation_result:{creation_result}"
             )
             revision: Dict = {}
@@ -1211,9 +1325,10 @@ class HostedLLMBackend(LLMBackend):
     def critique(self, image_path: str, vision: str, iteration: int, critique_frame: str = "") -> Dict:
         try:
             raw = self._chat_text(
-                "Evaluate this artwork and respond using exactly two lines:\n"
+                "Evaluate this artwork and respond using exactly three lines:\n"
                 "SCORE: <integer 1-10>\n"
-                "FEEDBACK: <one concise critique sentence in first person>",
+                "FEEDBACK: <one concise critique sentence in first person>\n"
+                "NEXT_ACTION: <one concrete command for the next image attempt>",
                 f"vision:{vision}\niteration:{iteration}\ncritique_frame:{critique_frame}",
                 220,
                 image_path,
@@ -1246,9 +1361,22 @@ class HostedLLMBackend(LLMBackend):
                     image_path,
                 )
                 feedback = _first_nonempty_line(fp_raw) or feedback
+            next_action = _normalize_action_command(
+                _extract_labeled_value(raw, "next_action")
+                or _extract_labeled_value(raw, "action")
+                or ""
+            )
+            if not next_action:
+                action_raw = self._chat_text(
+                    "Respond with exactly one line: NEXT_ACTION: <one concrete command for the next image prompt>.",
+                    f"vision:{vision}\niteration:{iteration}\nscore:{parsed_score}\nfeedback:{feedback}",
+                    120,
+                    image_path,
+                )
+                next_action = _normalize_action_command(action_raw)
             if not feedback:
                 raise ValueError("Could not parse critique feedback.")
-            return {"score": parsed_score, "feedback": feedback}
+            return {"score": parsed_score, "feedback": feedback, "next_action": next_action}
         except Exception as exc:
             raise HostedCallError(f"Hosted critique failed: {exc}") from exc
 
@@ -1342,7 +1470,7 @@ class HostedLLMBackend(LLMBackend):
             recent = [m.get("vision", "") for m in memories[-8:]]
             packet = build_soul_packet(soul)
             text = self._chat_text(
-                "Return exactly one concise art vision sentence in first person. No JSON. No bullet points.",
+                ACTION_VISION_CONTRACT,
                 (
                     SOUL_CONTEXT_GUIDANCE
                     + FIRST_PERSON_HINT
@@ -1352,10 +1480,7 @@ class HostedLLMBackend(LLMBackend):
                 ),
                 90,
             )
-            vision = text.strip().strip('"').splitlines()[0].strip()
-            if vision and not _contains_first_person(vision):
-                rewrite = self._chat_text("Rewrite this vision in first person. One sentence only.", f"vision:{vision}", 90)
-                vision = _first_nonempty_line(rewrite) or vision
+            vision = _normalize_action_vision(text, soul)
             if not vision:
                 raise ValueError("empty vision")
             return vision
@@ -1367,9 +1492,10 @@ class HostedLLMBackend(LLMBackend):
             packet = build_soul_packet(soul_data)
             out = self._chat_text(
                 "Respond using three lines:\n"
-                "VISION_DIRECTIVE: <first-person text, <= 140 chars>\n"
-                "CRITIQUE_DIRECTIVE: <first-person text, <= 140 chars>\n"
-                "REVISION_DIRECTIVE: <first-person text, <= 140 chars>",
+                "VISION_DIRECTIVE: <imperative command for the next image prompt>\n"
+                "CRITIQUE_DIRECTIVE: <imperative command for how to judge/score>\n"
+                "REVISION_DIRECTIVE: <imperative command for what to revise in soul>\n"
+                "Do not output first-person reflections or policy summaries.",
                 (
                     FIRST_PERSON_HINT
                     + SOUL_CONTEXT_GUIDANCE
@@ -1381,12 +1507,6 @@ class HostedLLMBackend(LLMBackend):
             vd = _extract_labeled_value(out, "vision_directive")
             cd = _extract_labeled_value(out, "critique_directive")
             rd = _extract_labeled_value(out, "revision_directive")
-            if vd and not _contains_first_person(vd):
-                vd = f"I will {vd[:120].lstrip()}"
-            if cd and not _contains_first_person(cd):
-                cd = f"I will {cd[:120].lstrip()}"
-            if rd and not _contains_first_person(rd):
-                rd = f"I will {rd[:120].lstrip()}"
             return {"vision_directive": vd, "critique_directive": cd, "revision_directive": rd}
         except Exception as exc:
             raise HostedCallError(f"Hosted run intent generation failed: {exc}") from exc
@@ -1406,7 +1526,8 @@ class HostedLLMBackend(LLMBackend):
             out = self._chat_text(
                 "You are revising only the iteration image prompt for the next attempt.\n"
                 "The run vision is fixed and must not be rewritten.\n"
-                "Make minimal, targeted edits to CURRENT_IMAGE_PROMPT using critique feedback.\n"
+                "Apply the critique feedback as concrete visual editing commands.\n"
+                "Make minimal, targeted edits to CURRENT_IMAGE_PROMPT.\n"
                 "Return exactly one line in this format:\n"
                 "IMAGE_PROMPT: <revised prompt text>",
                 (
@@ -1443,6 +1564,7 @@ class HostedLLMBackend(LLMBackend):
             context = (
                 SOUL_CONTEXT_GUIDANCE
                 + TIER_GUIDANCE_TEXT
+                + REVISION_ACTION_HINT
                 + f"soul_packet:{packet}\ncreation_result:{creation_result}"
             )
             revision: Dict = {}
@@ -1536,8 +1658,8 @@ class OllamaVisionBackend(VisionBackend):
         _print_vision_context_summary(soul, preferences, principles, instructions, memories)
         recent_visions = [m.get("vision", "") for m in memories[-8:]]
         prompt = (
-            "Generate one concise art vision sentence. "
-            "Use first-person voice (I/my). Do not output JSON. Keep it under 18 words.\n\n"
+            ACTION_VISION_CONTRACT
+            + "\n\n"
             + SOUL_CONTEXT_GUIDANCE
             + FIRST_PERSON_HINT
             + TIER_GUIDANCE_TEXT
@@ -1549,17 +1671,9 @@ class OllamaVisionBackend(VisionBackend):
             + "Prefer subtle variation while preserving continuity with the artist's soul."
         )
         try:
-            _trace_prompt(self.trace_prompts, "vision.generate", self.provider, self.model, "Generate one concise art vision sentence.", prompt)
-            candidate = _ollama_generate_text(self.base_url, self.model, prompt, self.temperature, timeout=60).strip().strip('"').replace("\n", " ")
-            if candidate and not _contains_first_person(candidate):
-                rewrite = _ollama_generate_text(
-                    self.base_url,
-                    self.model,
-                    f"Rewrite in first person only (one sentence): {candidate}",
-                    self.temperature,
-                    timeout=40,
-                ).strip().strip('"').replace("\n", " ")
-                candidate = rewrite or candidate
+            _trace_prompt(self.trace_prompts, "vision.generate", self.provider, self.model, ACTION_VISION_CONTRACT, prompt)
+            raw = _ollama_generate_text(self.base_url, self.model, prompt, self.temperature, timeout=60)
+            candidate = _normalize_action_vision(raw, soul)
             _, _, _, prioritized = infer_guidance(text_memories)
             if memory_collision(parse_vision(candidate), memories[-5:], prioritized):
                 raise HostedCallError("Ollama vision collided with recent pattern.")
@@ -1609,18 +1723,16 @@ class HostedVisionBackend(VisionBackend):
         _print_vision_context_summary(soul, preferences, principles, instructions, memories)
         recent_visions = [m.get("vision", "") for m in memories[-8:]]
         try:
-            candidate = self._chat_text(
-                "Generate one concise art vision sentence.",
+            raw = self._chat_text(
+                ACTION_VISION_CONTRACT,
                 FIRST_PERSON_HINT
                 + SOUL_CONTEXT_GUIDANCE
                 + TIER_GUIDANCE_TEXT
                 + f"soul_packet:{packet}\npreferences:{preferences[-8:]}\nprinciples:{principles[-8:]}\ninstructions:{instructions[-8:]}\nrecent:{recent_visions}\n"
                 + "Prefer subtle variation while preserving continuity with the artist's soul.",
                 90,
-            ).strip().strip('"').replace("\n", " ")
-            if candidate and not _contains_first_person(candidate):
-                rewrite = self._chat_text("Rewrite in first person only, one sentence.", f"vision:{candidate}", 90).strip().strip('"').replace("\n", " ")
-                candidate = rewrite or candidate
+            )
+            candidate = _normalize_action_vision(raw, soul)
             _, _, _, prioritized = infer_guidance(text_memories)
             if memory_collision(parse_vision(candidate), memories[-5:], prioritized):
                 raise HostedCallError("Hosted vision collided with recent pattern.")

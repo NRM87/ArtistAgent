@@ -17,6 +17,8 @@ The project supports hosted providers (Gemini/OpenAI/Anthropic), local Ollama mo
 - Local Ollama support for vision + LLM reasoning
 - LLM-driven ASCII fallback with enforced canvas size
 - Fixed run vision with iterative image-prompt refinement per run
+- Action-oriented vision contract (`My vision for this run is to ...`) with defensive normalization for weak models
+- Critique outputs include a concrete `NEXT_ACTION` command that feeds prompt refinement
 - Tolerant labeled-field parsing for weak local models (no strict JSON dependency in loop decisions)
 - First-person artist voice for vision, critique, and reflection
 - Stale lock recovery for interrupted runs
@@ -115,14 +117,22 @@ If image generation fails and `image_fallback=ascii`:
 ## Run Workflow
 
 Per run:
-1. Generate one run vision from soul context (personality, obsession, memories, history).
+1. Generate one fixed run vision from soul context in actionable form (`My vision for this run is to ...`).
 2. Keep that run vision fixed for the entire run.
 3. Iterate up to 5 attempts:
    - generate image from current iteration image prompt
-   - critique/judge from artist model
+   - critique/judge from artist model with a concrete `NEXT_ACTION`
    - refine only the iteration image prompt for next attempt
 4. Persist best artifact + tier (`masterpiece` / `study` / `failure`).
 5. Reflect and optionally edit soul fields (obsession, traits, memories).
+
+## Weak Local Model Notes
+
+For small local models (for example `qwen2.5:3b`), the loop expects labeled outputs and normalizes passive/meta responses into concrete commands. If outputs still feel generic:
+
+- keep `offline` policy with Ollama + ASCII fallback for deterministic local iteration
+- prefer explicit artist obsessions/principles in `soul.json`
+- inspect run directives and `NEXT_ACTION` lines to verify action quality
 
 ## Ollama Setup
 

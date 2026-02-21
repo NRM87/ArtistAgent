@@ -110,6 +110,7 @@ Important distinction:
 
 5. Run vision contract
 - The run vision is generated once at run start and remains fixed through iterations.
+- Vision text should be actionable and concrete (target format: `My vision for this run is to ...`).
 - Iterative refinement modifies only the per-iteration image prompt.
 - Do not reintroduce iteration-time vision rewriting.
 
@@ -120,6 +121,7 @@ Important distinction:
 7. Voice contract
 - Artist-facing reflective language should remain first-person where feasible (vision/critique/memory notes).
 - Avoid third-person self-reference in generated self-reflection text.
+- Critique should include a concrete next-step command (for prompt refinement), not only abstract commentary.
 
 ## Extension Playbook
 

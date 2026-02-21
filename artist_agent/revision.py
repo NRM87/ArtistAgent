@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -10,15 +11,71 @@ MAX_REVISION_NOTE_CHARS = 300
 MAX_DIRECTIVE_CHARS = 160
 MAX_TRAITS = 10
 
+DEFAULT_VISION_DIRECTIVE = "Create one concrete scene with a clear focal subject, composition, and mood."
+DEFAULT_CRITIQUE_DIRECTIVE = "Judge fidelity to the run vision and name one concrete next change."
+DEFAULT_REVISION_DIRECTIVE = "Record one actionable learning and revise soul fields only when evidence supports it."
+
+
+def _looks_meta_directive(text: str) -> bool:
+    probe = str(text).strip().lower()
+    if not probe:
+        return True
+    blocked = (
+        "artwork tiers",
+        "guide decisions",
+        "soul packet",
+        "soul_packet",
+        "soul context",
+        "personality_traits:",
+        "text_memories:",
+        "artwork_memories:",
+        "history:",
+        "respond using",
+        "return exactly",
+        "<",
+        ">",
+    )
+    return any(token in probe for token in blocked)
+
+
+def _normalize_directive(raw: str, default: str) -> str:
+    value = " ".join(str(raw).replace("\r\n", "\n").replace("\r", "\n").split()).strip()
+    value = re.sub(r"(?im)^(vision|critique|revision)_directive\s*[:=-]\s*", "", value).strip()
+    value = value.strip('"').strip("'")
+    if not value or _looks_meta_directive(value):
+        return default
+
+    value = re.sub(
+        r"(?i)^(i\s+(will|want to|intend to|need to|should|am going to)\s+|my\s+(goal|focus|task|plan)\s+is\s+to\s+)",
+        "",
+        value,
+    ).strip()
+    value = re.sub(r"(?i)^to\s+", "", value).strip()
+    value = re.sub(r"\s+", " ", value).strip(" .,:;")
+    if not value:
+        return default
+
+    actionable = re.match(
+        r"(?i)^(create|compose|render|paint|draw|depict|illustrate|craft|focus|judge|score|identify|compare|revise|update|record|preserve|avoid|tighten|strengthen|reduce|increase|add|remove|keep|test|check|emphasize|clarify|balance|shift|improve|use|try|set)\b",
+        value,
+    )
+    if not actionable:
+        value = f"Focus on {value[0].lower() + value[1:]}" if len(value) > 1 else default
+
+    value = value[:MAX_DIRECTIVE_CHARS].strip()
+    if not value.endswith((".", "!", "?")):
+        value += "."
+    return value
+
 
 def normalize_run_intent(intent: Dict) -> Dict:
     if not isinstance(intent, dict):
-        return {"vision_directive": "", "critique_directive": "", "revision_directive": ""}
+        intent = {}
 
     return {
-        "vision_directive": str(intent.get("vision_directive", "")).strip()[:MAX_DIRECTIVE_CHARS],
-        "critique_directive": str(intent.get("critique_directive", "")).strip()[:MAX_DIRECTIVE_CHARS],
-        "revision_directive": str(intent.get("revision_directive", "")).strip()[:MAX_DIRECTIVE_CHARS],
+        "vision_directive": _normalize_directive(intent.get("vision_directive", ""), DEFAULT_VISION_DIRECTIVE),
+        "critique_directive": _normalize_directive(intent.get("critique_directive", ""), DEFAULT_CRITIQUE_DIRECTIVE),
+        "revision_directive": _normalize_directive(intent.get("revision_directive", ""), DEFAULT_REVISION_DIRECTIVE),
     }
 
 

@@ -44,7 +44,8 @@ from .state import (
 
 
 def build_initial_image_prompt(vision: str, vision_directive: str) -> str:
-    base = "Compose a coherent 2D image that expresses the fixed run vision."
+    v = str(vision).strip() or "Create a coherent 2D composition."
+    base = f"Execute this run vision directly: {v}"
     directive = str(vision_directive).strip()
     if directive:
         return f"{base} {directive}"
@@ -110,7 +111,8 @@ def build_critique_frame(soul: Dict, run_intent: Dict) -> str:
         f"artwork_memories:{art_mem}\n"
         f"recent_history:{history}\n"
         f"critique_directive:{str(run_intent.get('critique_directive', '')).strip()}\n"
-        "Use this context for subjective evaluation according to the artist's own values. Respond in first person."
+        "Use this context for subjective evaluation according to the artist's own values. "
+        "Respond in first person and include one concrete next-action command."
     )
 
 
@@ -245,7 +247,7 @@ def run() -> None:
                 defer_and_persist(soul, creation_id, f"{exc} | fallback failed: {fallback_exc}", runtime.soul_path, runtime.temp_dir)
                 return
 
-        run_intent = {"vision_directive": "", "critique_directive": "", "revision_directive": ""}
+        run_intent = normalize_run_intent({})
         try:
             run_intent = normalize_run_intent(llm_backend.generate_run_intent(soul_for_guidance))
         except Exception as exc:
@@ -258,6 +260,9 @@ def run() -> None:
         prompt = build_render_prompt(vision, image_prompt)
         critique_directive = build_critique_frame(soul_for_guidance, run_intent)
         revision_directive = str(run_intent.get("revision_directive", "")).strip()
+        print(f"\nRun directive (vision): {vision_directive}")
+        print(f"Run directive (critique): {str(run_intent.get('critique_directive', '')).strip()}")
+        print(f"Run directive (revision): {revision_directive}")
         print("\n" + "-" * 58)
 
         for i in range(5):
@@ -283,18 +288,22 @@ def run() -> None:
 
             score = int(critique["score"])
             feedback = str(critique["feedback"])
+            next_action = str(critique.get("next_action", "")).strip()
             print(f"  Score: {score}/10")
             print(f"  Critique: \"{feedback}\"")
+            if next_action:
+                print(f"  Next action: \"{next_action}\"")
 
+            feedback_for_revision = feedback if not next_action else f"{feedback} Next action: {next_action}"
             if score > best_score:
-                best_score, best_path, best_iteration, best_feedback = score, Path(image_path), i + 1, feedback
+                best_score, best_path, best_iteration, best_feedback = score, Path(image_path), i + 1, feedback_for_revision
             if score >= 8:
                 break
             try:
                 image_prompt = llm_backend.refine_render_prompt(
                     image_prompt,
                     vision,
-                    feedback,
+                    feedback_for_revision,
                     score,
                     soul_for_guidance,
                     run_intent=run_intent,
