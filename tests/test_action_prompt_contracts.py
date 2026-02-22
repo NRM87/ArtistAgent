@@ -103,6 +103,15 @@ def test_normalize_action_command_rewrites_artist_name_possessive():
     assert "my ideals" in action.lower()
 
 
+def test_normalize_action_command_rewrites_unicode_apostrophe_possessive():
+    action = _normalize_action_command(
+        "NEXT_ACTION: Increase contrast to match Square Votary’s ideals in the focal area.",
+        self_name="Square Votary",
+    )
+    assert "square votary" not in action.lower()
+    assert "my ideals" in action.lower()
+
+
 def test_mock_backend_can_generate_initial_render_prompt():
     backend = MockLLMBackend()
     prompt = backend.generate_initial_render_prompt(
@@ -136,5 +145,11 @@ def test_image_prompt_quality_checks_reject_wrappers_and_misalignment():
 def test_critique_quality_checks_reject_trivial_outputs():
     assert not _meaningful_feedback("My vision for")
     assert not _meaningful_next_action("Create.")
+    assert not _meaningful_feedback(
+        "A precise and geometrically balanced artwork featuring meticulously aligned squares and right angles."
+    )
+    assert not _meaningful_next_action(
+        "Create a coherent 2D composition using the iteration image prompt while staying faithful to the fixed run vision."
+    )
     assert _meaningful_feedback("I lost depth in the foreground, so I should deepen shadow contrast around the focal arch.")
     assert _meaningful_next_action("Increase rim light on the left edge of the fox and darken the rear background.")

@@ -205,7 +205,7 @@ def _self_name_patterns(self_name: str) -> List[Tuple[str, str]]:
         return []
     esc = re.escape(name)
     return [
-        (rf"(?i)\b{esc}'s\b", "my"),
+        (rf"(?i)\b{esc}[\'\u2019]s\b", "my"),
         (rf"(?i)\b{esc}\s+should\b", "I should"),
         (rf"(?i)\b{esc}\s+will\b", "I will"),
         (rf"(?i)\b{esc}\s+wants?\b", "I want"),
@@ -217,8 +217,8 @@ def _self_name_patterns(self_name: str) -> List[Tuple[str, str]]:
 def _normalize_self_reference(text: str, self_name: str = "") -> str:
     value = str(text)
     patterns: List[Tuple[str, str]] = [
-        (r"(?i)\bthe artist's\b", "my"),
-        (r"(?i)\bthis artist's\b", "my"),
+        (r"(?i)\bthe artist[\'\u2019]s\b", "my"),
+        (r"(?i)\bthis artist[\'\u2019]s\b", "my"),
     ] + _self_name_patterns(self_name)
     for pattern, replacement in patterns:
         value = re.sub(pattern, replacement, value)
@@ -300,13 +300,28 @@ def _meaningful_feedback(text: str) -> bool:
     v = str(text).strip()
     if len(v) < 28 or _word_count(v) < 6:
         return False
-    blocked = ("my vision for", "run vision", "image prompt", "create.")
-    return not any(token in v.lower() for token in blocked)
+    lower = v.lower()
+    blocked = (
+        "my vision for",
+        "run vision",
+        "image prompt",
+        "iteration image prompt",
+        "create a coherent 2d composition",
+    )
+    if any(token in lower for token in blocked):
+        return False
+    # Require evaluative language so pure prompt restatements do not pass as critique.
+    return bool(re.search(r"\b(should|need|needs|must|improv|lacks?|missing|too|more|less|because|but|however)\b", lower))
 
 
 def _meaningful_next_action(text: str) -> bool:
     v = str(text).strip()
     if len(v) < 18 or _word_count(v) < 4:
+        return False
+    lower = v.lower()
+    if "iteration image prompt" in lower or "run vision (fixed for this run)" in lower:
+        return False
+    if "create a coherent 2d composition using the iteration image prompt" in lower:
         return False
     if re.match(r"(?i)^(create|draw|paint|render|focus|improve|emphasize)\.?$", v):
         return False
@@ -366,6 +381,10 @@ def _normalize_action_command(raw: str, self_name: str = "") -> str:
     ).strip()
     value = _normalize_self_reference(value, self_name)
     value = re.sub(r"(?i)^to\s+", "", value).strip()
+    if "iteration image prompt" in value.lower() or "run vision (fixed for this run)" in value.lower():
+        return ""
+    if "create a coherent 2d composition using the iteration image prompt" in value.lower():
+        return ""
     value = value.strip(" .,:;-")
     if not value or _looks_meta_vision(value):
         return ""
