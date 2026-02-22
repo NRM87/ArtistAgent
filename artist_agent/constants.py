@@ -34,6 +34,8 @@ DEFAULT_PROVIDER_MODELS = {
     "openai": "gpt-4.1-mini",
     "anthropic": "claude-3-5-sonnet-latest",
     "gemini": "gemini-2.5-pro",
+    "codex": "gpt-5",
+    "cli": "gemini",
     "ollama": "qwen2.5:3b",
 }
 
@@ -41,12 +43,15 @@ DEFAULT_VISION_MODELS = {
     "openai": "gpt-4.1-mini",
     "anthropic": "claude-3-5-sonnet-latest",
     "gemini": "gemini-2.5-pro",
+    "codex": "gpt-5",
+    "cli": "gemini",
     "ollama": "qwen2.5:3b",
 }
 
 DEFAULT_IMAGE_MODELS = {
     "openai": "gpt-image-1",
     "gemini": "gemini-2.0-flash-exp-image-generation",
+    "codex": "gpt-5",
 }
 
 DEFAULT_REFLECTION_WEIGHTS = {
@@ -60,6 +65,8 @@ PROVIDER_CAPABILITIES = {
     "openai": {"vision_text": True, "llm": True, "image": True},
     "anthropic": {"vision_text": True, "llm": True, "image": False},
     "gemini": {"vision_text": True, "llm": True, "image": True},
+    "codex": {"vision_text": True, "llm": True, "image": True},
+    "cli": {"vision_text": True, "llm": True, "image": False},
     "ollama": {"vision_text": True, "llm": True, "image": False},
     "ascii": {"vision_text": False, "llm": False, "image": True},
     "local": {"vision_text": True, "llm": False, "image": False},
@@ -71,9 +78,11 @@ DEFAULT_PROFILE_CONFIG = {
     "run_mode": "create",
     "vision_backend": "gemini",
     "vision_model": "gemini-2.5-pro",
+    "vision_cli": "gemini",
     "vision_temperature": 0.4,
     "llm_backend": "gemini",
     "llm_model": "gemini-2.5-pro",
+    "llm_cli": "gemini",
     "llm_temperature": 0.2,
     "ollama_base_url": "http://localhost:11434",
     "image_backend": "gemini",

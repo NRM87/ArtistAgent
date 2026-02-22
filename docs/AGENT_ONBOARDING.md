@@ -63,9 +63,9 @@ Run modes:
 `artist_agent/backends.py`
 - Backend classes and provider HTTP implementations.
 - Supports:
-  - vision: local, hosted, ollama
-  - llm: hosted, ollama
-  - image: hosted, ascii
+  - vision: local, hosted, cli/codex, ollama
+  - llm: hosted, cli/codex, ollama
+  - image: hosted, codex, ascii
   - fallback: LLM-generated ASCII with deterministic canvas enforcement
 - Structured text-field prompting/parsing for weak-model robustness (loop-critical actions avoid strict JSON contracts).
 - First-person voice guidance for self-reflection pathways (vision/critique/memory/revision text).

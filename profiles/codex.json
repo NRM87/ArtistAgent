@@ -1,0 +1,19 @@
+{
+  "run_policy": "strict",
+  "run_mode": "create",
+  "vision_backend": "codex",
+  "vision_model": "gpt-5",
+  "vision_cli": "codex",
+  "vision_temperature": 0.4,
+  "llm_backend": "codex",
+  "llm_model": "gpt-5",
+  "llm_cli": "codex",
+  "llm_temperature": 0.2,
+  "image_backend": "codex",
+  "image_model": "gpt-5",
+  "image_size": "1024x1024",
+  "image_fallback": "ascii",
+  "ascii_size": "160x60",
+  "trace_revision": false,
+  "trace_prompts": false
+}

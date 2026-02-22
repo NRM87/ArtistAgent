@@ -1,4 +1,6 @@
 import json
+import os
+import shutil
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -74,6 +76,17 @@ def _extract_model_rows(provider: str, payload: Dict, method_filter: str = "", c
     return rows
 
 
+def _resolve_cli_executable(name: str) -> str:
+    candidates = [name]
+    if os.name == "nt":
+        candidates = [f"{name}.cmd", f"{name}.exe", name]
+    for candidate in candidates:
+        path = shutil.which(candidate)
+        if path:
+            return path
+    return ""
+
+
 def _infer_provider_for_listing(args) -> str:
     if args.provider.strip():
         return args.provider.strip()
@@ -84,7 +97,7 @@ def _infer_provider_for_listing(args) -> str:
 
 def list_models(args) -> None:
     provider = _infer_provider_for_listing(args)
-    if provider in ("local", "mock", "ascii"):
+    if provider in ("local", "mock", "ascii", "cli", "codex"):
         print(f"Provider '{provider}' is local-only and does not expose a hosted model catalog.")
         return
 
@@ -162,6 +175,27 @@ def _provider_probe(provider: str, api_key: str, ollama_base_url: str) -> str:
             payload = _http_get_json(f"{base}/api/tags", {"Content-Type": "application/json"}, timeout=3)
             count = len(payload.get("models", []) or [])
             return f"ok ({count} local models)"
+        if provider == "cli":
+            preferred = str(api_key).strip().lower()
+            targets = [preferred] if preferred in ("gemini", "codex") else ["gemini", "codex"]
+            found = []
+            missing = []
+            for t in targets:
+                exe = _resolve_cli_executable(t)
+                if not exe:
+                    missing.append(t)
+                    continue
+                found.append(t)
+            if found and not missing:
+                return f"ok ({', '.join(found)})"
+            if found and missing:
+                return f"partial ({', '.join(found)} ok; missing {', '.join(missing)})"
+            return "error: no supported CLI adapters found"
+        if provider == "codex":
+            exe = _resolve_cli_executable("codex")
+            if exe:
+                return "ok (codex)"
+            return "error: codex CLI not found"
         return "n/a"
     except urllib.error.HTTPError as exc:
         return f"http {exc.code}"
@@ -202,6 +236,23 @@ def check_backends(args) -> None:
 
         if provider in ("local", "mock", "ascii"):
             line += " -> ok (built-in)"
+            print(line)
+            continue
+
+        if provider == "cli":
+            adapter = str(getattr(args, "vision_cli" if role == "vision" else "llm_cli", "gemini")).strip().lower()
+            if args.probe:
+                line += f" -> {_provider_probe('cli', adapter, base_url)}"
+            else:
+                line += f" -> configured ({adapter})"
+            print(line)
+            continue
+
+        if provider == "codex":
+            if args.probe:
+                line += f" -> {_provider_probe('codex', '', base_url)}"
+            else:
+                line += " -> configured (codex)"
             print(line)
             continue
 

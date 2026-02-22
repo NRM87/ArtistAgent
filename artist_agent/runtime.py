@@ -5,6 +5,9 @@ from pathlib import Path
 
 from .backends import (
     AsciiImageBackend,
+    CliLLMBackend,
+    CliVisionBackend,
+    CodexImageBackend,
     HostedImageBackend,
     HostedLLMBackend,
     HostedVisionBackend,
@@ -68,25 +71,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--artists-dir", default=DEFAULT_ARTISTS_DIR)
     p.add_argument("--profiles-dir", default=DEFAULT_PROFILES_DIR)
     p.add_argument("--profile", default="")
-    p.add_argument("--provider", choices=["gemini", "openai", "anthropic", "ollama", "local", "mock"], default="")
+    p.add_argument("--provider", choices=["gemini", "openai", "anthropic", "codex", "cli", "ollama", "local", "mock"], default="")
     p.add_argument("--run-policy", choices=["strict", "hybrid", "offline"], default="strict")
     p.add_argument("--run-mode", choices=["create", "full", "ingest-reviews"], default="create")
     p.add_argument("--contains", default="")
     p.add_argument("--method", default="")
     p.add_argument("--probe", action="store_true")
 
-    p.add_argument("--vision-backend", choices=["local", "openai", "anthropic", "gemini", "ollama"], default="local")
+    p.add_argument("--vision-backend", choices=["local", "openai", "anthropic", "gemini", "codex", "cli", "ollama"], default="local")
     p.add_argument("--vision-model", default="")
+    p.add_argument("--vision-cli", choices=["gemini", "codex"], default="gemini")
     p.add_argument("--vision-api-key", default="")
     p.add_argument("--vision-temperature", type=float, default=0.4)
 
-    p.add_argument("--llm-backend", choices=["mock", "openai", "anthropic", "gemini", "ollama"], default="mock")
+    p.add_argument("--llm-backend", choices=["mock", "openai", "anthropic", "gemini", "codex", "cli", "ollama"], default="mock")
     p.add_argument("--llm-model", default="")
+    p.add_argument("--llm-cli", choices=["gemini", "codex"], default="gemini")
     p.add_argument("--llm-api-key", default="")
     p.add_argument("--llm-temperature", type=float, default=0.2)
     p.add_argument("--ollama-base-url", default="http://localhost:11434")
 
-    p.add_argument("--image-backend", choices=["ascii", "mock", "openai", "gemini"], default="mock")
+    p.add_argument("--image-backend", choices=["ascii", "mock", "openai", "gemini", "codex"], default="mock")
     p.add_argument("--image-model", default="")
     p.add_argument("--image-api-key", default="")
     p.add_argument("--image-size", default="1024x1024")
@@ -252,8 +257,8 @@ def validate_backend_choices(args: argparse.Namespace) -> None:
     if run_mode == "ingest-reviews":
         if not PROVIDER_CAPABILITIES.get(args.llm_backend, {}).get("llm", False):
             raise ValueError(f"{args.llm_backend} is not supported for review-ingestion LLM backend.")
-        if args.llm_backend == "mock":
-            raise ValueError("Mock critique backend is disabled. Use ollama/openai/anthropic/gemini for review ingestion.")
+    if args.llm_backend == "mock":
+        raise ValueError("Mock critique backend is disabled. Use ollama/openai/anthropic/gemini/cli for review ingestion.")
         return
 
     if not PROVIDER_CAPABILITIES.get(args.image_backend, {}).get("image", False):
@@ -263,7 +268,7 @@ def validate_backend_choices(args: argparse.Namespace) -> None:
     if not PROVIDER_CAPABILITIES.get(args.vision_backend, {}).get("vision_text", False):
         raise ValueError(f"{args.vision_backend} is not supported for vision generation backend.")
     if args.llm_backend == "mock":
-        raise ValueError("Mock critique backend is disabled. Use ollama/openai/anthropic/gemini for LLM-driven criticism.")
+        raise ValueError("Mock critique backend is disabled. Use ollama/openai/anthropic/gemini/cli for LLM-driven criticism.")
     if args.image_backend == "mock":
         raise ValueError("Mock image backend is disabled. Use ascii/openai/gemini.")
     if str(getattr(args, "image_fallback", "defer")).strip().lower() == "mock":
@@ -272,13 +277,29 @@ def validate_backend_choices(args: argparse.Namespace) -> None:
     if args.run_policy == "strict" and (args.vision_backend == "local" or args.llm_backend == "mock" or args.image_backend == "mock"):
         raise ValueError(
             "Strict mode disallows deterministic local vision and all mock backends. "
-            "Use hosted/ollama backends, or switch to hybrid/offline."
+            "Use hosted/codex/cli/ollama backends, or switch to hybrid/offline."
         )
 
 
 def build_vision_backend(args: argparse.Namespace):
     if args.vision_backend == "local":
         return LocalVisionBackend()
+    if args.vision_backend == "codex":
+        model = args.vision_model.strip() or DEFAULT_VISION_MODELS["codex"]
+        return CliVisionBackend(
+            cli="codex",
+            model=model,
+            temperature=max(0.0, min(1.0, float(args.vision_temperature))),
+            trace_prompts=bool(getattr(args, "trace_prompts", False)),
+        )
+    if args.vision_backend == "cli":
+        model = args.vision_model.strip() or DEFAULT_VISION_MODELS["cli"]
+        return CliVisionBackend(
+            cli=str(getattr(args, "vision_cli", "gemini")).strip().lower() or "gemini",
+            model=model,
+            temperature=max(0.0, min(1.0, float(args.vision_temperature))),
+            trace_prompts=bool(getattr(args, "trace_prompts", False)),
+        )
     if args.vision_backend == "ollama":
         model = args.vision_model.strip() or DEFAULT_VISION_MODELS["ollama"]
         vision_temp = max(0.0, min(1.0, float(args.vision_temperature)))
@@ -310,6 +331,28 @@ def build_vision_backend(args: argparse.Namespace):
 def build_llm_backend(args: argparse.Namespace):
     if args.llm_backend == "mock":
         return MockLLMBackend()
+    if args.llm_backend == "codex":
+        model = args.llm_model.strip() or DEFAULT_PROVIDER_MODELS["codex"]
+        llm_temp = max(0.0, min(1.0, float(args.llm_temperature)))
+        if llm_temp < 0.2:
+            llm_temp = 0.2
+        return CliLLMBackend(
+            cli="codex",
+            model=model,
+            temperature=llm_temp,
+            trace_prompts=bool(getattr(args, "trace_prompts", False)),
+        )
+    if args.llm_backend == "cli":
+        model = args.llm_model.strip() or DEFAULT_PROVIDER_MODELS["cli"]
+        llm_temp = max(0.0, min(1.0, float(args.llm_temperature)))
+        if llm_temp < 0.2:
+            llm_temp = 0.2
+        return CliLLMBackend(
+            cli=str(getattr(args, "llm_cli", "gemini")).strip().lower() or "gemini",
+            model=model,
+            temperature=llm_temp,
+            trace_prompts=bool(getattr(args, "trace_prompts", False)),
+        )
     if args.llm_backend == "ollama":
         model = args.llm_model.strip() or DEFAULT_PROVIDER_MODELS["ollama"]
         llm_temp = max(0.0, min(1.0, float(args.llm_temperature)))
@@ -345,6 +388,20 @@ def build_image_backend(args: argparse.Namespace, temp_dir: Path, llm_backend=No
             temp_dir,
             llm_backend=llm_backend,
             ascii_size=str(getattr(args, "ascii_size", "160x60")).strip() or "160x60",
+        )
+    if args.image_backend == "codex":
+        model = args.image_model.strip() or DEFAULT_IMAGE_MODELS["codex"]
+        fallback_mode = str(getattr(args, "image_fallback", "ascii")).strip().lower() or "ascii"
+        if fallback_mode not in ("defer", "ascii"):
+            fallback_mode = "ascii"
+        return CodexImageBackend(
+            model=model,
+            temp_dir=temp_dir,
+            image_size=str(getattr(args, "image_size", "1024x1024")).strip() or "1024x1024",
+            fallback_mode=fallback_mode,
+            llm_backend=llm_backend,
+            ascii_size=str(getattr(args, "ascii_size", "160x60")).strip() or "160x60",
+            trace_prompts=bool(getattr(args, "trace_prompts", False)),
         )
     if args.image_backend == "mock":
         return MockImageBackend(temp_dir)

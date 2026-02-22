@@ -17,13 +17,13 @@ from .state import atomic_write_json, load_config_file, safe_default_soul
 
 def run_setup(args) -> None:
     print("Initial setup")
-    provider = input("Default provider [gemini/openai/anthropic/ollama] (gemini): ").strip().lower() or "gemini"
-    if provider not in ("gemini", "openai", "anthropic", "ollama"):
+    provider = input("Default provider [gemini/openai/anthropic/codex/cli/ollama] (gemini): ").strip().lower() or "gemini"
+    if provider not in ("gemini", "openai", "anthropic", "codex", "cli", "ollama"):
         provider = "gemini"
-    image_provider = provider if provider in ("gemini", "openai") else "gemini"
+    image_provider = provider if provider in ("gemini", "openai", "codex") else "ascii"
     api_key = ""
     env_name = ""
-    if provider != "ollama":
+    if provider not in ("ollama", "cli", "codex"):
         api_key = input(f"Enter {provider.upper()} API key (blank to skip): ").strip()
         env_name = {"gemini": "GEMINI_API_KEY", "openai": "OPENAI_API_KEY", "anthropic": "ANTHROPIC_API_KEY"}[provider]
 
@@ -47,6 +47,9 @@ def run_setup(args) -> None:
             "image_fallback": "ascii",
         }
     )
+    if provider == "cli":
+        profile["vision_cli"] = "gemini"
+        profile["llm_cli"] = "gemini"
     profile_path(args, "default").write_text(json.dumps(profile, indent=2), encoding="utf-8")
 
     artist_id = input(f"Artist ID ({args.artist}): ").strip() or args.artist

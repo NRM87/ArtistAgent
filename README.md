@@ -7,7 +7,7 @@ A multi-artist CLI system where each artist recursively:
 - critiques and judges output in first-person voice
 - updates memories, personality, and obsession over time
 
-The project supports hosted providers (Gemini/OpenAI/Anthropic), local Ollama models, and LLM-driven ASCII fallback behavior.
+The project supports hosted providers (Gemini/OpenAI/Anthropic), Codex-first CLI backends, generic CLI-backed providers (Gemini CLI/Codex CLI), local Ollama models, and LLM-driven ASCII fallback behavior.
 
 ## Key Features
 
@@ -88,6 +88,30 @@ Configure profile non-interactively (only explicit flags are changed):
 
 ```powershell
 python recursive_artist_agent.py configure-models --profile local_ollama --non-interactive --run-policy offline --vision-backend ollama --vision-model qwen2.5:3b --llm-backend ollama --llm-model qwen2.5:3b --ollama-base-url http://localhost:11434 --image-backend ascii --ascii-size 200x80
+```
+
+Configure profile to use CLI-backed reasoning (no API key required for vision/LLM):
+
+```powershell
+python recursive_artist_agent.py configure-models --profile cli_artist --non-interactive --run-policy strict --vision-backend cli --vision-cli gemini --vision-model gemini --llm-backend cli --llm-cli codex --llm-model codex --image-backend ascii --ascii-size 200x80
+```
+
+Notes:
+- `--vision-cli` / `--llm-cli` choose adapter (`gemini` or `codex`).
+- `--vision-model` / `--llm-model` accept either plain model names or `<adapter>:<model>` form (for example `codex:gpt-5`).
+- CLI backends cover vision + critique/revision text paths; image generation still uses `ascii` fallback unless you configure an image API backend.
+
+Use dedicated Codex backends (vision + llm + image) out-of-box:
+
+```powershell
+python recursive_artist_agent.py configure-models --profile codex --non-interactive --run-policy strict --vision-backend codex --vision-model gpt-5 --llm-backend codex --llm-model gpt-5 --image-backend codex --image-model gpt-5 --image-fallback ascii
+```
+
+Or start directly from the included `profiles/codex.json` profile:
+
+```powershell
+python recursive_artist_agent.py create-artist --artist codex_artist --profile codex
+python recursive_artist_agent.py run --artist codex_artist
 ```
 
 List models:

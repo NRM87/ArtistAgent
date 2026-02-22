@@ -1,8 +1,12 @@
 import base64
 import hashlib
 import json
+import os
 import re
+import shutil
 import struct
+import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -84,6 +88,143 @@ def _post_json_with_retry(url: str, payload: Dict, headers: Dict, timeout: int, 
     if last_exc is not None:
         raise last_exc
     raise RuntimeError("Unknown request failure")
+
+
+def _resolve_cli_executable(name: str) -> str:
+    candidates = [name]
+    if os.name == "nt":
+        candidates = [f"{name}.cmd", f"{name}.exe", name]
+    for candidate in candidates:
+        path = shutil.which(candidate)
+        if path:
+            return path
+    raise FileNotFoundError(f"CLI executable not found for '{name}'.")
+
+
+def _split_cli_model_spec(cli_default: str, model_spec: str) -> Tuple[str, str]:
+    cli = str(cli_default).strip().lower() or "gemini"
+    spec = str(model_spec).strip()
+    if not spec:
+        return cli, ""
+    low = spec.lower()
+    if low in ("gemini", "codex"):
+        return low, ""
+    for prefix in ("gemini:", "codex:"):
+        if low.startswith(prefix):
+            return prefix[:-1], spec.split(":", 1)[1].strip()
+    return cli, spec
+
+
+def _extract_text_from_json_tree(value: object) -> str:
+    if isinstance(value, str):
+        v = value.strip()
+        if v:
+            return v
+        return ""
+    if isinstance(value, list):
+        for item in value:
+            found = _extract_text_from_json_tree(item)
+            if found:
+                return found
+        return ""
+    if isinstance(value, dict):
+        for key in ("text", "output_text", "response", "message", "content", "result"):
+            if key in value:
+                found = _extract_text_from_json_tree(value.get(key))
+                if found:
+                    return found
+        for child in value.values():
+            found = _extract_text_from_json_tree(child)
+            if found:
+                return found
+    return ""
+
+
+def _run_cli_text(cli: str, model: str, prompt: str, timeout: int = 180) -> str:
+    selected_cli, selected_model = _split_cli_model_spec(cli, model)
+    prompt_text = str(prompt).replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not prompt_text:
+        raise ValueError("CLI prompt was empty.")
+
+    if selected_cli == "codex":
+        out_file = tempfile.NamedTemporaryFile(prefix="codex_last_", suffix=".txt", delete=False)
+        out_file.close()
+        proc = _run_codex_exec(
+            prompt_text,
+            model=selected_model,
+            output_last_message=out_file.name,
+            sandbox_mode="read-only",
+            timeout=timeout,
+        )
+        response = ""
+        try:
+            response = Path(out_file.name).read_text(encoding="utf-8", errors="replace").strip()
+        except Exception:
+            response = ""
+        finally:
+            try:
+                Path(out_file.name).unlink(missing_ok=True)
+            except Exception:
+                pass
+        if not response:
+            response = str(proc.stdout).strip()
+        if proc.returncode != 0 and not response:
+            stderr = str(proc.stderr).strip()
+            raise RuntimeError(stderr or f"codex exited with code {proc.returncode}")
+        return response
+
+    if selected_cli == "gemini":
+        exe = _resolve_cli_executable("gemini")
+        args = [exe, "-p", prompt_text, "--output-format", "json"]
+        if selected_model:
+            args.extend(["-m", selected_model])
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout, shell=False)
+        stdout = str(proc.stdout).strip()
+        stderr = str(proc.stderr).strip()
+        parsed_text = ""
+        if stdout:
+            try:
+                payload = json.loads(stdout)
+                parsed_text = _extract_text_from_json_tree(payload)
+            except Exception:
+                parsed_text = ""
+        if not parsed_text:
+            parsed_text = _first_nonempty_line(stdout)
+        if proc.returncode != 0 and not parsed_text:
+            raise RuntimeError(stderr or f"gemini exited with code {proc.returncode}")
+        if not parsed_text:
+            raise RuntimeError("gemini returned empty output.")
+        return parsed_text
+
+    raise ValueError(f"Unsupported CLI adapter '{selected_cli}'. Use 'gemini' or 'codex'.")
+
+
+def _run_codex_exec(
+    prompt: str,
+    model: str = "",
+    output_last_message: str = "",
+    sandbox_mode: str = "read-only",
+    timeout: int = 240,
+) -> subprocess.CompletedProcess:
+    exe = _resolve_cli_executable("codex")
+    args = [
+        exe,
+        "exec",
+        "--skip-git-repo-check",
+        "--sandbox",
+        sandbox_mode,
+        "-a",
+        "never",
+        "--ephemeral",
+        "--color",
+        "never",
+    ]
+    if output_last_message:
+        args.extend(["--output-last-message", str(output_last_message)])
+    if model:
+        args.extend(["-m", model])
+    args.append("-")
+    return subprocess.run(args, input=str(prompt), capture_output=True, text=True, timeout=timeout, shell=False)
 
 
 def _first_nonempty_line(text: str) -> str:
@@ -1039,6 +1180,65 @@ class HostedImageBackend(ImageBackend):
                 raise HostedCallError(f"Hosted image generation failed: {exc}") from exc
             print(f"Warning: hosted image generation failed, falling back to {self.fallback_mode} ({exc})")
             return self._fallback_backend.generate(prompt, iteration, creation_id)
+
+
+class CodexImageBackend(ImageBackend):
+    def __init__(
+        self,
+        model: str,
+        temp_dir: Path,
+        image_size: str = "1024x1024",
+        fallback_mode: str = "ascii",
+        llm_backend: Optional[object] = None,
+        ascii_size: str = "160x60",
+        trace_prompts: bool = False,
+    ):
+        self.provider = "codex"
+        self.model = model
+        self.temp_dir = temp_dir
+        self.image_size = image_size
+        self.fallback_mode = fallback_mode if fallback_mode in ("ascii", "defer") else "ascii"
+        self.trace_prompts = trace_prompts
+        self._fallback_backend = AsciiImageBackend(temp_dir, llm_backend=llm_backend, ascii_size=ascii_size)
+
+    def _build_codex_image_task(self, prompt: str, output_path: Path) -> str:
+        return (
+            "Generate exactly one PNG image and save it to output_path.\n"
+            "Use Codex image generation capabilities. Do not output markdown.\n"
+            "Do not create any file other than the requested output image.\n"
+            f"output_path:{str(output_path)}\n"
+            f"target_size:{self.image_size}\n"
+            f"image_prompt:{str(prompt).strip()}"
+        )
+
+    def generate(self, prompt: str, iteration: int, creation_id: int) -> str:
+        self.temp_dir.mkdir(parents=True, exist_ok=True)
+        out_path = self.temp_dir / f"codex_img_{creation_id:04d}_iter_{iteration}.png"
+        task = self._build_codex_image_task(prompt, out_path)
+        try:
+            _trace_prompt(
+                self.trace_prompts,
+                "image.generate.codex",
+                self.provider,
+                self.model or "(default)",
+                "Generate one PNG image and write it to output_path.",
+                task,
+            )
+            proc = _run_codex_exec(
+                task,
+                model=self.model,
+                sandbox_mode="workspace-write",
+                timeout=300,
+            )
+            if out_path.exists() and out_path.stat().st_size > 0:
+                return str(out_path)
+            detail = _first_nonempty_line(proc.stderr) or _first_nonempty_line(proc.stdout) or "Codex image output missing."
+            raise RuntimeError(detail)
+        except Exception as exc:
+            if self.fallback_mode == "ascii":
+                print(f"Warning: codex image generation failed, falling back to ascii ({exc})")
+                return self._fallback_backend.generate(prompt, iteration, creation_id)
+            raise HostedCallError(f"Codex image generation failed: {exc}") from exc
 
 
 class LLMBackend:
@@ -2063,6 +2263,36 @@ class HostedLLMBackend(LLMBackend):
             raise HostedCallError(f"Hosted review-merit evaluation failed: {exc}") from exc
 
 
+class CliLLMBackend(HostedLLMBackend):
+    def __init__(self, cli: str, model: str = "", temperature: float = 0.2, trace_prompts: bool = False):
+        cli_name, cli_model = _split_cli_model_spec(cli, model)
+        super().__init__(
+            provider=f"cli-{cli_name}",
+            model=cli_model,
+            api_key="",
+            temperature=temperature,
+            allow_fallback=False,
+            trace_prompts=trace_prompts,
+        )
+        self.cli = cli_name
+
+    def _chat_text(self, system_prompt: str, user_prompt: str, max_tokens: int = 400, image_path: Optional[str] = None) -> str:
+        _trace_prompt(self.trace_prompts, "cli.chat", self.provider, self.model or "(default)", system_prompt, user_prompt)
+        artifact_note = ""
+        if image_path:
+            p = Path(image_path)
+            if p.suffix.lower() == ".txt":
+                snippet = p.read_text(encoding="utf-8", errors="replace")[:2000]
+                artifact_note = f"\n\nASCII_ARTIFACT:\n{snippet}"
+            elif p.exists():
+                artifact_note = f"\n\nIMAGE_PATH: {str(p)}"
+        prompt = f"{system_prompt}\n\n{user_prompt}{artifact_note}"
+        try:
+            return _run_cli_text(self.cli, self.model, prompt, timeout=240)
+        except Exception as exc:
+            raise HostedCallError(f"CLI LLM call failed ({self.cli}): {exc}") from exc
+
+
 class VisionBackend:
     def generate_vision(self, soul: Dict, ignored_ids: set) -> str:
         raise NotImplementedError
@@ -2173,6 +2403,28 @@ class HostedVisionBackend(VisionBackend):
             return candidate
         except Exception as exc:
             raise HostedCallError(f"Hosted vision generation failed: {exc}") from exc
+
+
+class CliVisionBackend(HostedVisionBackend):
+    def __init__(self, cli: str, model: str = "", temperature: float = 0.4, trace_prompts: bool = False):
+        cli_name, cli_model = _split_cli_model_spec(cli, model)
+        super().__init__(
+            provider=f"cli-{cli_name}",
+            model=cli_model,
+            api_key="",
+            temperature=temperature,
+            allow_fallback=False,
+            trace_prompts=trace_prompts,
+        )
+        self.cli = cli_name
+
+    def _chat_text(self, system_prompt: str, user_prompt: str, max_tokens: int = 200) -> str:
+        _trace_prompt(self.trace_prompts, "vision.generate.cli", self.provider, self.model or "(default)", system_prompt, user_prompt)
+        prompt = f"{system_prompt}\n\n{user_prompt}"
+        try:
+            return _run_cli_text(self.cli, self.model, prompt, timeout=240)
+        except Exception as exc:
+            raise HostedCallError(f"CLI vision call failed ({self.cli}): {exc}") from exc
 
 
 
