@@ -173,8 +173,23 @@ def _extract_block(text: str, start_marker: str, end_marker: str) -> str:
 def _normalize_prompt_text(text: str) -> str:
     value = str(text).replace("\r\n", "\n").replace("\r", "\n").strip()
     value = re.sub(r"(?im)^\s*image_prompt\s*[:=-]\s*", "", value).strip()
+    # Strip wrapper echo lines if the model repeats scaffold text.
+    cleaned_lines: List[str] = []
+    for line in value.split("\n"):
+        ln = line.strip()
+        if re.match(r'(?i)^run vision\s*\(fixed for this run\)\s*[:=-]\s*"', ln):
+            continue
+        if re.match(r'(?i)^iteration image prompt\s*[:=-]\s*"', ln):
+            continue
+        if "create a coherent 2d composition using the iteration image prompt" in ln.lower():
+            continue
+        cleaned_lines.append(line)
+    value = "\n".join(cleaned_lines).strip()
+    value = value.replace("RUN_VISION", "").replace("run_vision", "").strip()
+    value = re.sub(r"(?i)\bmy vision for this run is to\b", "", value).strip()
     # Keep multiline prompts readable but collapse redundant blank runs.
     value = re.sub(r"\n{3,}", "\n\n", value)
+    value = re.sub(r"\s+", " ", value).strip()
     if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
         value = value[1:-1].strip()
     return value
@@ -267,10 +282,77 @@ def _looks_meta_vision(text: str) -> bool:
         "instructions:",
         "respond using",
         "return exactly",
+        "run_vision",
+        "vision_directive",
+        "critique_directive",
+        "revision_directive",
         "<",
         ">",
     )
     return any(token in probe for token in blocked)
+
+
+def _word_count(text: str) -> int:
+    return len(re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?", str(text)))
+
+
+def _meaningful_feedback(text: str) -> bool:
+    v = str(text).strip()
+    if len(v) < 28 or _word_count(v) < 6:
+        return False
+    blocked = ("my vision for", "run vision", "image prompt", "create.")
+    return not any(token in v.lower() for token in blocked)
+
+
+def _meaningful_next_action(text: str) -> bool:
+    v = str(text).strip()
+    if len(v) < 18 or _word_count(v) < 4:
+        return False
+    if re.match(r"(?i)^(create|draw|paint|render|focus|improve|emphasize)\.?$", v):
+        return False
+    return True
+
+
+def _prompt_keywords(text: str) -> List[str]:
+    stop = {
+        "the", "and", "for", "with", "that", "this", "from", "into", "while", "about", "across", "under",
+        "over", "your", "my", "vision", "image", "create", "run", "fixed", "using", "stay", "faithful", "next",
+    }
+    out: List[str] = []
+    for tok in re.findall(r"[a-zA-Z]{4,}", str(text).lower()):
+        if tok in stop:
+            continue
+        if tok not in out:
+            out.append(tok)
+    return out
+
+
+def _is_usable_image_prompt(prompt: str) -> bool:
+    p = _normalize_prompt_text(prompt)
+    if len(p) < 28 or _word_count(p) < 6:
+        return False
+    blocked = (
+        "run vision (fixed for this run)",
+        "iteration image prompt",
+        "respond with exactly",
+        "image_prompt:",
+    )
+    if any(token in p.lower() for token in blocked):
+        return False
+    return True
+
+
+def _is_prompt_aligned_with_vision(prompt: str, vision: str) -> bool:
+    p = _normalize_prompt_text(prompt).lower()
+    v = str(vision).strip().lower()
+    if not p or not v:
+        return False
+    p_tokens = set(_prompt_keywords(p))
+    v_tokens = set(_prompt_keywords(v))
+    if not p_tokens or not v_tokens:
+        return True
+    overlap = p_tokens.intersection(v_tokens)
+    return len(overlap) >= 1
 
 
 def _normalize_action_command(raw: str, self_name: str = "") -> str:
@@ -310,6 +392,8 @@ def _normalize_action_vision(raw: str, soul: Optional[Dict] = None) -> str:
         candidate = ""
 
     body = _normalize_self_reference(candidate, str((soul or {}).get("name", "")).strip())
+    body = re.sub(r"(?i)\brun[_\s-]*vision\b", "", body).strip()
+    body = re.sub(r"(?i)\b(vision|my_vision)\s*[:=-]\s*", "", body).strip()
     lower = body.lower()
     if lower.startswith("my vision for this run is to "):
         body = body[len("my vision for this run is to ") :].strip()
@@ -321,6 +405,8 @@ def _normalize_action_vision(raw: str, soul: Optional[Dict] = None) -> str:
         body,
     ).strip()
     body = re.sub(r"(?i)^to\s+", "", body).strip(" .,:;-")
+    if re.fullmatch(r"(?i)(my vision for this run is to )?", body):
+        body = ""
 
     if _looks_meta_vision(body):
         body = ""
@@ -958,6 +1044,9 @@ class LLMBackend:
     def generate_run_intent(self, soul_data: Dict) -> Dict:
         raise NotImplementedError
 
+    def generate_initial_render_prompt(self, soul_data: Dict, vision: str, run_intent: Optional[Dict] = None) -> str:
+        raise NotImplementedError
+
     def refine_render_prompt(
         self,
         current_prompt: str,
@@ -1045,6 +1134,13 @@ class MockLLMBackend(LLMBackend):
     def generate_run_intent(self, soul_data: Dict) -> Dict:
         raise HostedCallError("Run intent requires an LLM backend, but current backend is mock.")
 
+    def generate_initial_render_prompt(self, soul_data: Dict, vision: str, run_intent: Optional[Dict] = None) -> str:
+        directive = str((run_intent or {}).get("vision_directive", "")).strip()
+        base = str(vision).strip() or "Create a coherent 2D composition."
+        if directive:
+            return f"{base} {directive}"
+        return base
+
     def refine_render_prompt(
         self,
         current_prompt: str,
@@ -1130,17 +1226,18 @@ class OllamaLLMBackend(LLMBackend):
             if parsed_score is None:
                 raise ValueError("Could not parse critique score.")
             feedback = _extract_labeled_value(raw, "feedback") or _first_nonempty_line(raw)
-            if not feedback or feedback.isdigit():
+            if not feedback or feedback.isdigit() or not _meaningful_feedback(feedback):
                 feedback_raw = self._chat_text(
-                    "Respond with exactly one concise critique sentence in first person only.",
+                    "Respond with exactly one critique sentence in first person. "
+                    "It must name at least one concrete visual issue and one concrete improvement.",
                     f"vision:{vision}\niteration:{iteration}\nscore:{parsed_score}\ncritique_frame:{critique_frame}",
                     image_path=image_path,
                 )
                 feedback = _first_nonempty_line(feedback_raw)
             feedback = _normalize_self_reference(feedback, artist_name)
-            if feedback and not _contains_first_person(feedback):
+            if feedback and (not _contains_first_person(feedback) or not _meaningful_feedback(feedback)):
                 fp_raw = self._chat_text(
-                    "Rewrite in first person only. Return one sentence.",
+                    "Rewrite in first person only. Return one concrete sentence with visual detail.",
                     f"feedback:{feedback}",
                     image_path=image_path,
                 )
@@ -1152,15 +1249,17 @@ class OllamaLLMBackend(LLMBackend):
                 or "",
                 artist_name,
             )
-            if not next_action:
+            if not next_action or not _meaningful_next_action(next_action):
                 action_raw = self._chat_text(
-                    "Respond with exactly one line: NEXT_ACTION: <one concrete command for the next image prompt>.",
+                    "Respond with exactly one line: NEXT_ACTION: <specific command with subject/composition/lighting/color detail>.",
                     f"vision:{vision}\niteration:{iteration}\nscore:{parsed_score}\nfeedback:{feedback}",
                     image_path=image_path,
                 )
                 next_action = _normalize_action_command(action_raw, artist_name)
-            if not feedback:
+            if not feedback or not _meaningful_feedback(feedback):
                 raise ValueError("Could not parse critique feedback.")
+            if next_action and not _meaningful_next_action(next_action):
+                next_action = ""
             return {"score": parsed_score, "feedback": feedback, "next_action": next_action}
         except Exception as exc:
             raise HostedCallError(f"Ollama critique failed: {exc}") from exc
@@ -1294,6 +1393,38 @@ class OllamaLLMBackend(LLMBackend):
         except Exception as exc:
             raise HostedCallError(f"Ollama run-intent generation failed: {exc}") from exc
 
+    def generate_initial_render_prompt(self, soul_data: Dict, vision: str, run_intent: Optional[Dict] = None) -> str:
+        try:
+            packet = build_soul_packet(soul_data)
+            directive = str((run_intent or {}).get("vision_directive", "")).strip()
+            out = self._chat_text(
+                "Create the initial image-generation prompt for this run.\n"
+                "The run vision is fixed and must be executed directly.\n"
+                "Return exactly one line in this format:\n"
+                "IMAGE_PROMPT: <prompt text>\n"
+                "Do not use the artist name; use first-person framing only if needed.",
+                (
+                    f"fixed_run_vision:{vision}\n"
+                    f"vision_directive:{directive}\n"
+                    f"{_stage_weight_guidance(packet, 'vision')}\n"
+                    f"soul_packet:{packet}\n"
+                    "Write a concrete visual prompt (subject, composition, medium/style, mood, lighting, palette)."
+                ),
+            )
+            prompt = _extract_image_prompt(out, "", str(soul_data.get("name", "")).strip())
+            if not prompt or not _is_usable_image_prompt(prompt) or not _is_prompt_aligned_with_vision(prompt, vision):
+                retry = self._chat_text(
+                    "Respond with exactly one line: IMAGE_PROMPT: <text>.\n"
+                    "The prompt must concretely depict the run vision and include at least subject, composition, and mood.",
+                    f"fixed_run_vision:{vision}\nvision_directive:{directive}\n",
+                )
+                prompt = _extract_image_prompt(retry, "", str(soul_data.get("name", "")).strip())
+            if not prompt or not _is_usable_image_prompt(prompt) or not _is_prompt_aligned_with_vision(prompt, vision):
+                raise ValueError("empty initial image prompt")
+            return prompt
+        except Exception as exc:
+            raise HostedCallError(f"Ollama initial prompt generation failed: {exc}") from exc
+
     def refine_render_prompt(
         self,
         current_prompt: str,
@@ -1325,7 +1456,11 @@ class OllamaLLMBackend(LLMBackend):
                 )
             )
             next_prompt = _extract_image_prompt(out, current_prompt, str(soul_data.get("name", "")).strip())
-            if next_prompt == current_prompt:
+            if (
+                next_prompt == current_prompt
+                or not _is_usable_image_prompt(next_prompt)
+                or not _is_prompt_aligned_with_vision(next_prompt, vision)
+            ):
                 retry = self._chat_text(
                     "Respond with exactly one line: IMAGE_PROMPT: <text>",
                     (
@@ -1336,6 +1471,8 @@ class OllamaLLMBackend(LLMBackend):
                     ),
                 )
                 next_prompt = _extract_image_prompt(retry, current_prompt, str(soul_data.get("name", "")).strip())
+            if not _is_usable_image_prompt(next_prompt) or not _is_prompt_aligned_with_vision(next_prompt, vision):
+                return current_prompt
             return next_prompt or current_prompt
         except Exception as exc:
             raise HostedCallError(f"Ollama prompt refinement failed: {exc}") from exc
@@ -1530,18 +1667,19 @@ class HostedLLMBackend(LLMBackend):
             if parsed_score is None:
                 raise ValueError("Could not parse critique score.")
             feedback = _extract_labeled_value(raw, "feedback") or _first_nonempty_line(raw)
-            if not feedback or feedback.isdigit():
+            if not feedback or feedback.isdigit() or not _meaningful_feedback(feedback):
                 feedback_raw = self._chat_text(
-                    "Respond with exactly one concise critique sentence in first person only.",
+                    "Respond with exactly one critique sentence in first person. "
+                    "It must name at least one concrete visual issue and one concrete improvement.",
                     f"vision:{vision}\niteration:{iteration}\nscore:{parsed_score}\ncritique_frame:{critique_frame}",
                     160,
                     image_path,
                 )
                 feedback = _first_nonempty_line(feedback_raw)
             feedback = _normalize_self_reference(feedback, artist_name)
-            if feedback and not _contains_first_person(feedback):
+            if feedback and (not _contains_first_person(feedback) or not _meaningful_feedback(feedback)):
                 fp_raw = self._chat_text(
-                    "Rewrite in first person only. Return one sentence.",
+                    "Rewrite in first person only. Return one concrete sentence with visual detail.",
                     f"feedback:{feedback}",
                     140,
                     image_path,
@@ -1554,16 +1692,18 @@ class HostedLLMBackend(LLMBackend):
                 or "",
                 artist_name,
             )
-            if not next_action:
+            if not next_action or not _meaningful_next_action(next_action):
                 action_raw = self._chat_text(
-                    "Respond with exactly one line: NEXT_ACTION: <one concrete command for the next image prompt>.",
+                    "Respond with exactly one line: NEXT_ACTION: <specific command with subject/composition/lighting/color detail>.",
                     f"vision:{vision}\niteration:{iteration}\nscore:{parsed_score}\nfeedback:{feedback}",
                     120,
                     image_path,
                 )
                 next_action = _normalize_action_command(action_raw, artist_name)
-            if not feedback:
+            if not feedback or not _meaningful_feedback(feedback):
                 raise ValueError("Could not parse critique feedback.")
+            if next_action and not _meaningful_next_action(next_action):
+                next_action = ""
             return {"score": parsed_score, "feedback": feedback, "next_action": next_action}
         except Exception as exc:
             raise HostedCallError(f"Hosted critique failed: {exc}") from exc
@@ -1702,6 +1842,40 @@ class HostedLLMBackend(LLMBackend):
         except Exception as exc:
             raise HostedCallError(f"Hosted run intent generation failed: {exc}") from exc
 
+    def generate_initial_render_prompt(self, soul_data: Dict, vision: str, run_intent: Optional[Dict] = None) -> str:
+        try:
+            packet = build_soul_packet(soul_data)
+            directive = str((run_intent or {}).get("vision_directive", "")).strip()
+            out = self._chat_text(
+                "Create the initial image-generation prompt for this run.\n"
+                "The run vision is fixed and must be executed directly.\n"
+                "Return exactly one line in this format:\n"
+                "IMAGE_PROMPT: <prompt text>\n"
+                "Do not use the artist name; use first-person framing only if needed.",
+                (
+                    f"fixed_run_vision:{vision}\n"
+                    f"vision_directive:{directive}\n"
+                    f"{_stage_weight_guidance(packet, 'vision')}\n"
+                    f"soul_packet:{packet}\n"
+                    "Write a concrete visual prompt (subject, composition, medium/style, mood, lighting, palette)."
+                ),
+                280,
+            )
+            prompt = _extract_image_prompt(out, "", str(soul_data.get("name", "")).strip())
+            if not prompt or not _is_usable_image_prompt(prompt) or not _is_prompt_aligned_with_vision(prompt, vision):
+                retry = self._chat_text(
+                    "Respond with exactly one line: IMAGE_PROMPT: <text>.\n"
+                    "The prompt must concretely depict the run vision and include at least subject, composition, and mood.",
+                    f"fixed_run_vision:{vision}\nvision_directive:{directive}\n",
+                    120,
+                )
+                prompt = _extract_image_prompt(retry, "", str(soul_data.get("name", "")).strip())
+            if not prompt or not _is_usable_image_prompt(prompt) or not _is_prompt_aligned_with_vision(prompt, vision):
+                raise ValueError("empty initial image prompt")
+            return prompt
+        except Exception as exc:
+            raise HostedCallError(f"Hosted initial prompt generation failed: {exc}") from exc
+
     def refine_render_prompt(
         self,
         current_prompt: str,
@@ -1734,7 +1908,11 @@ class HostedLLMBackend(LLMBackend):
                 300,
             )
             next_prompt = _extract_image_prompt(out, current_prompt, str(soul_data.get("name", "")).strip())
-            if next_prompt == current_prompt:
+            if (
+                next_prompt == current_prompt
+                or not _is_usable_image_prompt(next_prompt)
+                or not _is_prompt_aligned_with_vision(next_prompt, vision)
+            ):
                 retry = self._chat_text(
                     "Respond with exactly one line: IMAGE_PROMPT: <text>",
                     (
@@ -1746,6 +1924,8 @@ class HostedLLMBackend(LLMBackend):
                     120,
                 )
                 next_prompt = _extract_image_prompt(retry, current_prompt, str(soul_data.get("name", "")).strip())
+            if not _is_usable_image_prompt(next_prompt) or not _is_prompt_aligned_with_vision(next_prompt, vision):
+                return current_prompt
             return next_prompt or current_prompt
         except Exception as exc:
             raise HostedCallError(f"Hosted prompt refinement failed: {exc}") from exc

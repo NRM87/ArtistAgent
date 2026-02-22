@@ -1,4 +1,12 @@
-from artist_agent.backends import _normalize_action_command, _normalize_action_vision
+from artist_agent.backends import (
+    MockLLMBackend,
+    _is_prompt_aligned_with_vision,
+    _is_usable_image_prompt,
+    _meaningful_feedback,
+    _meaningful_next_action,
+    _normalize_action_command,
+    _normalize_action_vision,
+)
 from artist_agent.revision import (
     DEFAULT_CRITIQUE_DIRECTIVE,
     DEFAULT_REVISION_DIRECTIVE,
@@ -93,3 +101,40 @@ def test_normalize_action_command_rewrites_artist_name_possessive():
     )
     assert "lyra's" not in action.lower()
     assert "my ideals" in action.lower()
+
+
+def test_mock_backend_can_generate_initial_render_prompt():
+    backend = MockLLMBackend()
+    prompt = backend.generate_initial_render_prompt(
+        {"name": "Lyra"},
+        "My vision for this run is to create a foggy bridge at dawn.",
+        run_intent={"vision_directive": "Emphasize angular silhouettes and cool tones."},
+    )
+    assert "foggy bridge" in prompt.lower()
+    assert "angular silhouettes" in prompt.lower()
+
+
+def test_normalize_action_vision_strips_run_vision_placeholder():
+    vision = _normalize_action_vision(
+        "RUN_VISION: My vision for this run is to create an image that RUN_VISION.",
+        soul={"name": "Lyra", "current_obsession": "geometric precision"},
+    )
+    assert "run_vision" not in vision.lower()
+    assert "my vision for this run is to" in vision.lower()
+
+
+def test_image_prompt_quality_checks_reject_wrappers_and_misalignment():
+    bad = (
+        'Run vision (fixed for this run): "My vision..."\n'
+        'Iteration image prompt: "A meticulously aligned geometric masterpiece"\n'
+        "Create a coherent 2D composition using the iteration image prompt while staying faithful to the fixed run vision."
+    )
+    assert not _is_usable_image_prompt(bad)
+    assert not _is_prompt_aligned_with_vision("A geometric masterpiece", "create a blue fox under moonlight")
+
+
+def test_critique_quality_checks_reject_trivial_outputs():
+    assert not _meaningful_feedback("My vision for")
+    assert not _meaningful_next_action("Create.")
+    assert _meaningful_feedback("I lost depth in the foreground, so I should deepen shadow contrast around the focal arch.")
+    assert _meaningful_next_action("Increase rim light on the left edge of the fox and darken the rear background.")

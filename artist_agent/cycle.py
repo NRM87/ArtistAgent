@@ -50,15 +50,6 @@ from .state import (
 )
 
 
-def build_initial_image_prompt(vision: str, vision_directive: str) -> str:
-    v = str(vision).strip() or "Create a coherent 2D composition."
-    base = f"Execute this run vision directly: {v}"
-    directive = str(vision_directive).strip()
-    if directive:
-        return f"{base} {directive}"
-    return base
-
-
 def build_render_prompt(vision: str, image_prompt: str) -> str:
     v = str(vision).strip() or "Create a coherent 2D composition."
     ip = str(image_prompt).strip() or v
@@ -482,10 +473,18 @@ def run() -> None:
             print(f"Run Intent Trace: {format_compact_json(run_intent)}")
 
         vision_directive = str(run_intent.get("vision_directive", "")).strip()
-        image_prompt = build_initial_image_prompt(vision, vision_directive)
-        prompt = build_render_prompt(vision, image_prompt)
         critique_directive = build_critique_frame(soul_for_guidance, run_intent)
         revision_directive = str(run_intent.get("revision_directive", "")).strip()
+        try:
+            image_prompt = llm_backend.generate_initial_render_prompt(
+                soul_for_guidance,
+                vision,
+                run_intent=run_intent,
+            )
+            prompt = build_render_prompt(vision, image_prompt)
+        except HostedCallError as exc:
+            defer_and_persist(soul, creation_id, str(exc), runtime.soul_path, runtime.temp_dir)
+            return
         print(f"\nRun directive (vision): {vision_directive}")
         print(f"Run directive (critique): {str(run_intent.get('critique_directive', '')).strip()}")
         print(f"Run directive (revision): {revision_directive}")

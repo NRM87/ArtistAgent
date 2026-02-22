@@ -152,12 +152,13 @@ If image generation fails and `image_fallback=ascii`:
 Per run:
 1. Generate one fixed run vision from soul context in actionable form (`My vision for this run is to ...`).
 2. Keep that run vision fixed for the entire run.
-3. Iterate up to 5 attempts:
+3. Ask the artist LLM to generate the initial iteration image prompt from the fixed run vision + soul context.
+4. Iterate up to 5 attempts:
    - generate image from current iteration image prompt
    - critique/judge from artist model with a concrete `NEXT_ACTION`
    - refine only the iteration image prompt for next attempt
-4. Persist best artifact + tier (`masterpiece` / `study` / `failure`).
-5. Reflect and optionally edit soul fields (obsession, traits, memories).
+5. Persist best artifact + tier (`masterpiece` / `study` / `failure`).
+6. Reflect and optionally edit soul fields (obsession, traits, memories).
 
 ## Weak Local Model Notes
 
@@ -166,6 +167,8 @@ For small local models (for example `qwen2.5:3b`), the loop expects labeled outp
 - keep `offline` policy with Ollama + ASCII fallback for deterministic local iteration
 - prefer explicit artist obsessions/principles in `soul.json`
 - inspect run directives and `NEXT_ACTION` lines to verify action quality
+
+The runtime now applies quality guardrails to reject malformed/placeholder outputs (for example `RUN_VISION` token leakage, trivial critique text, or one-word `NEXT_ACTION`), then retries once with stricter instructions.
 
 ## Ollama Setup
 
